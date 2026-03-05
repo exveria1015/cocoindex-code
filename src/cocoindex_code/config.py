@@ -66,6 +66,7 @@ class Config:
     device: str
     trust_remote_code: bool
     batch_size: int
+    extra_extensions: dict[str, str | None]
 
     @classmethod
     def from_env(cls) -> Config:
@@ -113,6 +114,19 @@ class Config:
                 f"COCOINDEX_CODE_BATCH_SIZE must be a positive integer, got: {batch_size}"
             )
 
+        # Extra file extensions (format: "inc:php,yaml,toml" — optional lang after colon)
+        raw_extra = os.environ.get("COCOINDEX_CODE_EXTRA_EXTENSIONS", "")
+        extra_extensions: dict[str, str | None] = {}
+        for token in raw_extra.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" in token:
+                ext, lang = token.split(":", 1)
+                extra_extensions[f".{ext.strip()}"] = lang.strip() or None
+            else:
+                extra_extensions[f".{token}"] = None
+
         return cls(
             codebase_root_path=root,
             embedding_model=embedding_model,
@@ -120,6 +134,7 @@ class Config:
             device=device,
             trust_remote_code=trust_remote_code,
             batch_size=batch_size,
+            extra_extensions=extra_extensions,
         )
 
     @property

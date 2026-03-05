@@ -114,6 +114,7 @@ Use the cocoindex-code MCP server for semantic code search when:
 | `COCOINDEX_CODE_ROOT_PATH` | Root path of the codebase | Auto-discovered (see below) |
 | `COCOINDEX_CODE_EMBEDDING_MODEL` | Embedding model (see below) | `sbert/sentence-transformers/all-MiniLM-L6-v2` |
 | `COCOINDEX_CODE_BATCH_SIZE` | Max batch size for local embedding model | `16` |
+| `COCOINDEX_CODE_EXTRA_EXTENSIONS` | Additional file extensions to index (comma-separated, e.g. `"inc:php,yaml,toml"` — use `ext:lang` to override language detection) | _(none)_ |
 
 
 ### Root Path Discovery

@@ -8,10 +8,11 @@ from cocoindex.resources.chunk import Chunk
 from cocoindex.resources.file import PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
 
+from .config import config
 from .shared import CODEBASE_DIR, SQLITE_DB, CodeChunk, embedder
 
 # File patterns for supported languages
-INCLUDED_PATTERNS = [
+DEFAULT_INCLUDED_PATTERNS = [
     "**/*.py",  # Python
     "**/*.pyi",  # Python stubs
     "**/*.js",  # JavaScript
@@ -42,6 +43,13 @@ INCLUDED_PATTERNS = [
     "**/*.rst",  # reStructuredText
     "**/*.php",  # PHP
 ]
+
+INCLUDED_PATTERNS = DEFAULT_INCLUDED_PATTERNS + [f"**/*{ext}" for ext in config.extra_extensions]
+
+# Language overrides from extra_extensions (e.g. ".inc" -> "php")
+LANGUAGE_OVERRIDES: dict[str, str] = {
+    ext: lang for ext, lang in config.extra_extensions.items() if lang is not None
+}
 
 EXCLUDED_PATTERNS = [
     "**/.*",  # Hidden directories
@@ -81,7 +89,12 @@ async def process_file(
         return
 
     # Get relative path and detect language
-    language = detect_code_language(filename=file.file_path.path.name) or "text"
+    suffix = file.file_path.path.suffix
+    language = (
+        LANGUAGE_OVERRIDES.get(suffix)
+        or detect_code_language(filename=file.file_path.path.name)
+        or "text"
+    )
 
     # Split into chunks
     chunks = splitter.split(
