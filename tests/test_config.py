@@ -6,35 +6,33 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from cocoindex_code.config import Config, _detect_device
+import pytest
+
+from cocoindex_code.config import Config
 
 
-class TestDetectDevice:
-    """Tests for device auto-detection."""
+class TestConfigDevice:
+    """Tests for COCOINDEX_CODE_DEVICE env var handling."""
 
-    def test_returns_cuda_when_available(self) -> None:
-        with patch.dict(os.environ, {}, clear=False):
-            # Ensure env var is unset
+    def test_none_by_default(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {"COCOINDEX_CODE_ROOT_PATH": str(tmp_path)},
+        ):
             os.environ.pop("COCOINDEX_CODE_DEVICE", None)
-            with patch("torch.cuda.is_available", return_value=True):
-                assert _detect_device() == "cuda"
+            config = Config.from_env()
+            assert config.device is None
 
-    def test_returns_cpu_when_cuda_unavailable(self) -> None:
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("COCOINDEX_CODE_DEVICE", None)
-            with patch("torch.cuda.is_available", return_value=False):
-                assert _detect_device() == "cpu"
-
-    def test_env_var_overrides_auto_detection(self) -> None:
-        with patch.dict(os.environ, {"COCOINDEX_CODE_DEVICE": "cpu"}):
-            with patch("torch.cuda.is_available", return_value=True):
-                assert _detect_device() == "cpu"
-
-    def test_returns_cpu_when_torch_missing(self) -> None:
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("COCOINDEX_CODE_DEVICE", None)
-            with patch.dict("sys.modules", {"torch": None}):
-                assert _detect_device() == "cpu"
+    def test_env_var_overrides_device(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_DEVICE": "cpu",
+            },
+        ):
+            config = Config.from_env()
+            assert config.device == "cpu"
 
 
 class TestConfigTrustRemoteCode:
@@ -158,3 +156,105 @@ class TestExtraExtensions:
         ):
             config = Config.from_env()
             assert config.extra_extensions == {".inc": "php", ".yaml": None, ".tpl": "html"}
+
+
+class TestExcludedPatterns:
+    """Tests for COCOINDEX_CODE_EXCLUDED_PATTERNS env var."""
+
+    def test_empty_by_default(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {"COCOINDEX_CODE_ROOT_PATH": str(tmp_path)},
+        ):
+            os.environ.pop("COCOINDEX_CODE_EXCLUDED_PATTERNS", None)
+            config = Config.from_env()
+            assert config.excluded_patterns == []
+
+    def test_parses_json_array(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": '["**/migration.sql", "**/*.d.ts"]',
+            },
+        ):
+            config = Config.from_env()
+            assert config.excluded_patterns == ["**/migration.sql", "**/*.d.ts"]
+
+    def test_preserves_commas_inside_globs(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": '["{**/*.md,**/*.txt}"]',
+            },
+        ):
+            config = Config.from_env()
+            assert config.excluded_patterns == ["{**/*.md,**/*.txt}"]
+
+    def test_trims_whitespace_and_ignores_empty_entries(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": '[" **/migration.sql ", " ", "**/*.d.ts"]',
+            },
+        ):
+            config = Config.from_env()
+            assert config.excluded_patterns == ["**/migration.sql", "**/*.d.ts"]
+
+    def test_empty_string_gives_empty_list(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": "",
+            },
+        ):
+            config = Config.from_env()
+            assert config.excluded_patterns == []
+
+    def test_rejects_invalid_json(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": "**/migration.sql,**/*.d.ts",
+            },
+        ):
+            with pytest.raises(
+                ValueError,
+                match=(
+                    "COCOINDEX_CODE_EXCLUDED_PATTERNS must be a JSON array of strings, "
+                    "got invalid JSON"
+                ),
+            ):
+                Config.from_env()
+
+    def test_rejects_valid_json_non_list(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": "{}",
+            },
+        ):
+            with pytest.raises(
+                ValueError,
+                match="COCOINDEX_CODE_EXCLUDED_PATTERNS must be a JSON array of strings",
+            ):
+                Config.from_env()
+
+    def test_rejects_non_string_entries(self, tmp_path: Path) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COCOINDEX_CODE_ROOT_PATH": str(tmp_path),
+                "COCOINDEX_CODE_EXCLUDED_PATTERNS": '["**/*.py", 1]',
+            },
+        ):
+            with pytest.raises(
+                ValueError,
+                match="COCOINDEX_CODE_EXCLUDED_PATTERNS must be a JSON array of strings",
+            ):
+                Config.from_env()

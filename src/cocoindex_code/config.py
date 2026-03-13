@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,33 @@ def _discover_codebase_root() -> Path:
     return root if root is not None else cwd
 
 
+def _parse_json_string_list_env(var_name: str) -> list[str]:
+    """Parse an environment variable as a JSON array of strings."""
+    raw_value = os.environ.get(var_name, "")
+    if not raw_value.strip():
+        return []
+
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{var_name} must be a JSON array of strings, got invalid JSON"
+        ) from exc
+
+    if not isinstance(parsed, list):
+        raise ValueError(f"{var_name} must be a JSON array of strings")
+
+    result: list[str] = []
+    for item in parsed:
+        if not isinstance(item, str):
+            raise ValueError(f"{var_name} must be a JSON array of strings")
+        item = item.strip()
+        if item:
+            result.append(item)
+
+    return result
+
+
 @dataclass
 class Config:
     """Configuration loaded from environment variables."""
@@ -52,6 +80,7 @@ class Config:
     device: str | None
     trust_remote_code: bool
     extra_extensions: dict[str, str | None]
+    excluded_patterns: list[str]
 
     @classmethod
     def from_env(cls) -> Config:
@@ -99,6 +128,11 @@ class Config:
             else:
                 extra_extensions[f".{token}"] = None
 
+        # Excluded file glob patterns
+        excluded_patterns = _parse_json_string_list_env(
+            "COCOINDEX_CODE_EXCLUDED_PATTERNS"
+        )
+
         return cls(
             codebase_root_path=root,
             embedding_model=embedding_model,
@@ -106,6 +140,7 @@ class Config:
             device=device,
             trust_remote_code=trust_remote_code,
             extra_extensions=extra_extensions,
+            excluded_patterns=excluded_patterns,
         )
 
     @property
