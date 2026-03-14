@@ -4,8 +4,7 @@ import logging
 
 logging.basicConfig(level=logging.WARNING)
 
-from .config import Config  # noqa: E402
-from .server import main, mcp  # noqa: E402
+from ._version import __version__  # noqa: E402
+from .server import main  # noqa: E402
 
-__version__ = "0.1.0"
-__all__ = ["Config", "main", "mcp"]
+__all__ = ["main", "__version__"]
