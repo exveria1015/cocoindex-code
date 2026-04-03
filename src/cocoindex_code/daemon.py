@@ -125,11 +125,19 @@ class ProjectRegistry:
     """Cache of loaded projects, keyed by project root path."""
 
     _projects: dict[str, Project]
-    _embedder: Embedder
+    _embedder: Embedder | None
+    _embedding_settings: Any
 
-    def __init__(self, embedder: Embedder) -> None:
+    def __init__(self, embedding_settings: Any) -> None:
         self._projects = {}
-        self._embedder = embedder
+        self._embedder = None
+        self._embedding_settings = embedding_settings
+
+    def get_embedder(self) -> Embedder:
+        """Create the shared embedder on first use."""
+        if self._embedder is None:
+            self._embedder = create_embedder(self._embedding_settings)
+        return self._embedder
 
     async def get_project(self, project_root: str) -> Project:
         """Get or create a Project for the given root. Lazy initialization."""
@@ -137,7 +145,11 @@ class ProjectRegistry:
             root = Path(project_root)
             project_settings = load_project_settings(root)
             chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
-            project = await Project.create(root, self._embedder, chunker_registry=chunker_registry)
+            project = await Project.create(
+                root,
+                self.get_embedder(),
+                chunker_registry=chunker_registry,
+            )
             self._projects[project_root] = project
         return self._projects[project_root]
 
@@ -160,6 +172,7 @@ class ProjectRegistry:
         for project in self._projects.values():
             project.close()
         self._projects.clear()
+        self._embedder = None
         gc.collect()
 
     def list_projects(self) -> list[DaemonProjectInfo]:
@@ -278,7 +291,7 @@ async def _handle_doctor(
     """
     if req.project_root is None:
         # Global-scope checks
-        yield DoctorResponse(result=await _check_model(registry._embedder))
+        yield DoctorResponse(result=await _check_model(registry.get_embedder()))
     else:
         # Project-scope checks
         yield DoctorResponse(result=await _check_file_walk(req.project_root))
@@ -512,9 +525,6 @@ def run_daemon() -> None:
     for key, value in user_settings.envs.items():
         os.environ[key] = value
 
-    # Create embedder
-    embedder = create_embedder(user_settings.embedding)
-
     # Write PID file
     pid_path = daemon_pid_path()
     pid_path.write_text(str(os.getpid()))
@@ -531,7 +541,7 @@ def run_daemon() -> None:
     logger.info("Daemon starting (PID %d, version %s)", os.getpid(), __version__)
 
     start_time = time.monotonic()
-    registry = ProjectRegistry(embedder)
+    registry = ProjectRegistry(user_settings.embedding)
 
     sock_path = daemon_socket_path()
     if sys.platform != "win32":

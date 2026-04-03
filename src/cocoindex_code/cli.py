@@ -617,23 +617,33 @@ def mcp() -> None:
         from .server import create_mcp_server
 
         mcp_server = create_mcp_server(project_root)
-        asyncio.create_task(_bg_index(project_root))
+        _start_bg_index(project_root)
         await mcp_server.run_stdio_async()
 
     asyncio.run(_run_mcp())
 
 
-async def _bg_index(project_root: str) -> None:
-    """Index in background. Each call opens its own daemon connection."""
-    import asyncio
+def _start_bg_index(project_root: str) -> None:
+    """Index in a detached daemon thread.
+
+    The MCP server must still be able to exit promptly on stdio EOF, so the
+    background index request cannot be tied to the asyncio event loop.
+    """
+    import threading
 
     from . import client as _client
 
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, lambda: _client.index(project_root))
-    except Exception:
-        pass
+    def _runner() -> None:
+        try:
+            _client.index(project_root)
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_runner,
+        name="cocoindex-code-bg-index",
+        daemon=True,
+    ).start()
 
 
 # --- Daemon subcommands ---

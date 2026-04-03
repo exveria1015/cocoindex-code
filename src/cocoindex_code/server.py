@@ -324,9 +324,9 @@ def main() -> None:
         mcp_server = create_mcp_server(str(project_root))
 
         async def _serve() -> None:
-            from .cli import _bg_index
+            from .cli import _start_bg_index
 
-            asyncio.create_task(_bg_index(str(project_root)))
+            _start_bg_index(str(project_root))
             await mcp_server.run_stdio_async()
 
         asyncio.run(_serve())

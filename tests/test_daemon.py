@@ -52,6 +52,58 @@ def calculate_fibonacci(n: int) -> int:
 '''
 
 
+def test_daemon_status_does_not_initialize_embedder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daemon startup/status should not eagerly load the embedder."""
+    import cocoindex_code.daemon as dm
+
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(tmp_path / "lazy_start"))
+    save_user_settings(default_user_settings())
+
+    def _fail_create_embedder(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("create_embedder should not run during daemon startup")
+
+    monkeypatch.setattr(dm, "create_embedder", _fail_create_embedder)
+
+    thread = threading.Thread(target=dm.run_daemon, daemon=True)
+    thread.start()
+
+    sock_path = dm.daemon_socket_path()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError("Daemon did not start")
+
+    conn = Client(sock_path, family=_connection_family())
+    try:
+        conn.send_bytes(encode_request(HandshakeRequest(version=__version__)))
+        handshake = decode_response(conn.recv_bytes())
+        assert handshake.ok is True
+
+        conn.send_bytes(encode_request(DaemonStatusRequest()))
+        status = decode_response(conn.recv_bytes())
+        assert status.version == __version__
+    finally:
+        conn.close()
+
+    stop_conn = Client(sock_path, family=_connection_family())
+    try:
+        stop_conn.send_bytes(encode_request(HandshakeRequest(version=__version__)))
+        handshake = decode_response(stop_conn.recv_bytes())
+        assert handshake.ok is True
+
+        stop_conn.send_bytes(encode_request(StopRequest()))
+        stop_resp = decode_response(stop_conn.recv_bytes())
+        assert stop_resp.ok is True
+    finally:
+        stop_conn.close()
+        thread.join(timeout=5)
+
+
 @pytest.fixture(scope="session")
 def daemon_sock() -> Iterator[str]:
     """Start a daemon once per session and return the socket path."""

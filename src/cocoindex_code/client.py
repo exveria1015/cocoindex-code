@@ -347,12 +347,7 @@ def start_daemon() -> subprocess.Popen[bytes]:
 
     daemon_dir().mkdir(parents=True, exist_ok=True)
     log_path = daemon_log_path()
-
-    ccc_path = _find_ccc_executable()
-    if ccc_path:
-        cmd = [ccc_path, "run-daemon"]
-    else:
-        cmd = [sys.executable, "-m", "cocoindex_code.cli", "run-daemon"]
+    cmd = [sys.executable, "-m", "cocoindex_code.daemon_entry"]
 
     log_fd = open(log_path, "w")
     if sys.platform == "win32":
@@ -374,17 +369,6 @@ def start_daemon() -> subprocess.Popen[bytes]:
         )
     log_fd.close()
     return proc
-
-
-def _find_ccc_executable() -> str | None:
-    """Find the ccc executable in PATH or the same directory as python."""
-    python_dir = Path(sys.executable).parent
-    names = ["ccc.exe", "ccc"] if sys.platform == "win32" else ["ccc"]
-    for name in names:
-        ccc = python_dir / name
-        if ccc.exists():
-            return str(ccc)
-    return None
 
 
 def _pid_alive(pid: int) -> bool:
