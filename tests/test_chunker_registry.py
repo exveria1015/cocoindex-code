@@ -11,12 +11,14 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import cocoindex as coco
 import numpy as np
 import pytest
 from cocoindex.connectors import sqlite as coco_sqlite
 from cocoindex.resources.schema import VectorSchema
 from example_toml_chunker import toml_chunker
 
+import cocoindex_code.indexer as _indexer
 import cocoindex_code.shared as _shared
 from cocoindex_code.chunking import CHUNKER_REGISTRY, Chunk, TextPosition
 from cocoindex_code.project import Project
@@ -182,3 +184,45 @@ async def test_registry_does_not_affect_other_suffixes(
     assert len(toml_chunks) == 2
     assert len(py_chunks) >= 1
     assert any("bar" in c["content"] for c in py_chunks)
+
+
+async def test_indexer_does_not_use_mount_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Indexing should no longer rely on mount_each fan-out."""
+
+    def _fail_mount_each(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("mount_each should not be used")
+
+    monkeypatch.setattr(coco, "mount_each", _fail_mount_each)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "sample.py").write_text("def foo():\n    return 1\n")
+
+    await _index_project(tmp_path, monkeypatch)
+    chunks = _query_chunks(tmp_path)
+
+    assert len(chunks) >= 1
+    assert any("foo" in c["content"] for c in chunks)
+
+
+async def test_large_files_use_streaming_chunker_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Large files should bypass RecursiveSplitter to avoid list materialization."""
+
+    def _fail_split(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("RecursiveSplitter should not be used for large files")
+
+    monkeypatch.setenv(_indexer.MAX_RECURSIVE_SPLIT_BYTES_ENV, "1")
+    monkeypatch.setattr(_indexer.splitter, "split", _fail_split)
+
+    (tmp_path / ".git").mkdir()
+    large_python = "".join(f"def func_{i}():\n    return {i}\n\n" for i in range(256))
+    (tmp_path / "big.py").write_text(large_python)
+
+    await _index_project(tmp_path, monkeypatch)
+    chunks = _query_chunks(tmp_path)
+
+    assert len(chunks) > 1
+    assert all(c["language"] == "python" for c in chunks)
+    assert any("func_0" in c["content"] for c in chunks)
