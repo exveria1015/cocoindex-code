@@ -288,6 +288,14 @@ def init(
 ) -> None:
     """Initialize a project for cocoindex-code."""
     cwd = Path.cwd().resolve()
+    if cwd == Path.home().resolve():
+        _typer.echo(
+            "Error: Refusing to initialize the home directory as a project.\n"
+            "Run `ccc init` inside a specific project directory instead.",
+            err=True,
+        )
+        raise _typer.Exit(code=1)
+
     settings_file = project_settings_path(cwd)
 
     # Always ensure user settings exist

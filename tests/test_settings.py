@@ -163,6 +163,40 @@ def test_find_project_root_returns_none_when_not_initialized(tmp_path: Path) -> 
     assert find_project_root(standalone) is None
 
 
+def test_find_project_root_ignores_home_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    (home / ".cocoindex_code").mkdir()
+    (home / ".cocoindex_code" / "settings.yml").write_text("include_patterns: []")
+
+    child = home / "workspace" / "repo"
+    child.mkdir(parents=True)
+    assert find_project_root(child) is None
+
+
+def test_find_project_root_under_home_finds_real_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    (home / ".cocoindex_code").mkdir()
+    (home / ".cocoindex_code" / "settings.yml").write_text("include_patterns: []")
+
+    project = home / "workspace" / "project"
+    (project / ".cocoindex_code").mkdir(parents=True)
+    (project / ".cocoindex_code" / "settings.yml").write_text("include_patterns: []")
+    subdir = project / "src"
+    subdir.mkdir()
+
+    assert find_project_root(subdir) == project
+
+
 def test_find_parent_with_marker_finds_git(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)

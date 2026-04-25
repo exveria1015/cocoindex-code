@@ -263,9 +263,17 @@ def find_project_root(start: Path) -> Path | None:
     """Walk up from *start* looking for ``.cocoindex_code/settings.yml``.
 
     Returns the directory containing it, or ``None``.
+
+    The home directory is intentionally not considered a project root.  By
+    default, ``~/.cocoindex_code`` is the user settings directory, so treating it
+    as a project marker would make any path under ``$HOME`` inherit the home
+    directory as its project root.
     """
+    home = Path.home().resolve()
     current = start.resolve()
     while True:
+        if current == home:
+            return None
         if (current / _SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME).is_file():
             return current
         parent = current.parent
@@ -279,9 +287,15 @@ def find_legacy_project_root(start: Path) -> Path | None:
 
     Used by the backward-compat ``cocoindex-code`` entrypoint to re-anchor to a
     previously-indexed project tree.  Returns the first matching directory, or ``None``.
+
+    As with ``find_project_root``, the home directory is skipped to avoid
+    confusing the user-level ``~/.cocoindex_code`` directory for a project.
     """
+    home = Path.home().resolve()
     current = start.resolve()
     while True:
+        if current == home:
+            return None
         if (current / _SETTINGS_DIR_NAME / _COCOINDEX_DB_NAME).exists():
             return current
         parent = current.parent

@@ -5,13 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from cocoindex_code.cli import (
     add_to_gitignore,
+    app,
     remove_from_gitignore,
     require_project_root,
     resolve_default_path,
 )
+
+runner = CliRunner()
 
 
 def test_require_project_root_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,6 +52,20 @@ def test_require_project_root_exits_when_not_initialized(
 
     with pytest.raises(Exit):
         require_project_root()
+
+
+def test_init_refuses_home_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(tmp_path / "ccc_home"))
+    monkeypatch.chdir(home)
+
+    result = runner.invoke(app, ["init"])
+
+    assert result.exit_code != 0
+    assert "Refusing to initialize the home directory" in result.output
+    assert not (home / ".cocoindex_code" / "settings.yml").exists()
 
 
 def test_resolve_default_path_from_subdirectory(

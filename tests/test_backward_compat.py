@@ -126,6 +126,23 @@ def test_legacy_root_discovery_with_cocoindex_db(tmp_path: Path) -> None:
     assert find_legacy_project_root(sub) == tmp_path
 
 
+def test_legacy_root_discovery_ignores_home_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user-level ~/.cocoindex_code DB should not make HOME a project root."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    idx_dir = home / ".cocoindex_code"
+    idx_dir.mkdir()
+    (idx_dir / "cocoindex.db").touch()
+
+    child = home / "workspace" / "repo"
+    child.mkdir(parents=True)
+    assert find_legacy_project_root(child) is None
+
+
 def test_legacy_excluded_patterns_conversion(tmp_path: Path) -> None:
     """COCOINDEX_CODE_EXCLUDED_PATTERNS should be appended to default exclude_patterns."""
 
