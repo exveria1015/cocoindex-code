@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 import functools
+import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import typer as _typer
 
-from .client import DaemonStartError
-from .protocol import DoctorCheckResult, IndexingProgress, ProjectStatusResponse, SearchResponse
+if TYPE_CHECKING:
+    from .protocol import (
+        DoctorCheckResult,
+        IndexingProgress,
+        ProjectStatusResponse,
+        SearchResponse,
+    )
+
 from .settings import (
+    DEFAULT_ST_MODEL,
+    EmbeddingSettings,
     cocoindex_db_path,
     default_project_settings,
-    default_user_settings,
     find_parent_with_marker,
     find_project_root,
+    format_path_for_display,
+    normalize_input_path,
     project_settings_path,
     resolve_db_dir,
+    save_initial_user_settings,
     save_project_settings,
-    save_user_settings,
     target_sqlite_db_path,
     user_settings_path,
 )
@@ -33,6 +44,29 @@ app = _typer.Typer(
 
 daemon_app = _typer.Typer(name="daemon", help="Manage the daemon process.")
 app.add_typer(daemon_app, name="daemon")
+
+
+@app.callback()
+def _apply_host_cwd() -> None:
+    """Honor ``COCOINDEX_CODE_HOST_CWD`` when forwarded from a ``docker exec`` wrapper.
+
+    The env var carries the host shell's pwd verbatim. We normalize it through
+    the host path mapping to container form and ``chdir`` there so
+    cwd-driven discovery (``find_project_root`` etc.) sees the user's real
+    project subtree. Unset → no-op.
+    """
+    host_cwd = os.environ.get("COCOINDEX_CODE_HOST_CWD")
+    if not host_cwd:
+        return
+    target = normalize_input_path(host_cwd)
+    try:
+        os.chdir(target)
+    except OSError as e:
+        _typer.echo(
+            f"Warning: COCOINDEX_CODE_HOST_CWD={host_cwd!r} → {target!r} "
+            f"is not accessible: {e}. Continuing with cwd={os.getcwd()!r}.",
+            err=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +83,7 @@ def require_project_root() -> Path:
     gs_path = user_settings_path()
     if not gs_path.is_file():
         _typer.echo(
-            f"Error: Global settings not found: {gs_path}\n"
+            f"Error: Global settings not found: {format_path_for_display(gs_path)}\n"
             "Run `ccc init` to create it with default settings.",
             err=True,
         )
@@ -76,6 +110,8 @@ def _catch_daemon_start_error(func: _F) -> _F:
 
     @functools.wraps(func)
     def wrapper(*args: object, **kwargs: object) -> object:
+        from .client import DaemonStartError
+
         try:
             return func(*args, **kwargs)
         except DaemonStartError as e:
@@ -110,7 +146,7 @@ def _format_progress(progress: IndexingProgress) -> str:
 
 def print_project_header(project_root: str) -> None:
     """Print the project root directory."""
-    _typer.echo(f"Project: {project_root}")
+    _typer.echo(f"Project: {format_path_for_display(project_root)}")
 
 
 def print_index_stats(status: ProjectStatusResponse) -> None:
@@ -176,7 +212,7 @@ def _run_index_with_progress(project_root: str) -> None:
         except RuntimeError as e:
             live.stop()
             # Let DaemonStartError propagate to the decorator for consistent handling.
-            if isinstance(e, DaemonStartError):
+            if isinstance(e, _client.DaemonStartError):
                 raise
             _typer.echo(f"Indexing failed: {e}", err=True)
             raise _typer.Exit(code=1)
@@ -282,8 +318,172 @@ def remove_from_gitignore(project_root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+_LITELLM_MODELS_URL = "https://docs.litellm.ai/docs/embedding/supported_embedding"
+
+
+def _resolve_embedding_choice(
+    litellm_model_flag: str | None,
+    st_installed: bool,
+    tty: bool,
+) -> EmbeddingSettings:
+    """Resolve the embedding settings per the init control-flow diagram."""
+    if litellm_model_flag is not None:
+        return EmbeddingSettings(provider="litellm", model=litellm_model_flag)
+
+    if not tty:
+        if st_installed:
+            return EmbeddingSettings(provider="sentence-transformers", model=DEFAULT_ST_MODEL)
+        _typer.echo(
+            "Error: sentence-transformers is not installed and stdin is not a TTY.\n"
+            "Either install the extra (`pip install 'cocoindex-code[embeddings-local]'`)\n"
+            "or pass `--litellm-model MODEL` to select a LiteLLM model.",
+            err=True,
+        )
+        raise _typer.Exit(code=1)
+
+    # Interactive
+    import questionary
+
+    if st_installed:
+        provider = questionary.select(
+            "Embedding provider",
+            choices=[
+                questionary.Choice(
+                    title="sentence-transformers (local, free)",
+                    value="sentence-transformers",
+                ),
+                questionary.Choice(
+                    title="litellm (cloud, 100+ providers)",
+                    value="litellm",
+                ),
+            ],
+        ).ask()
+    else:
+        _typer.echo(
+            "sentence-transformers is not installed — only `litellm` is available.\n"
+            "To enable local embeddings, install `cocoindex-code[embeddings-local]`."
+        )
+        provider = "litellm"
+
+    if provider is None:  # user cancelled (Ctrl-C / Esc)
+        raise _typer.Exit(code=1)
+
+    if provider == "sentence-transformers":
+        model = questionary.text("Model name", default=DEFAULT_ST_MODEL).ask()
+    elif provider == "litellm":
+        _typer.echo(f"See supported LiteLLM embedding models: {_LITELLM_MODELS_URL}")
+        model = questionary.text("Model name").ask()
+    else:
+        _typer.echo(f"Error: unknown provider {provider!r}", err=True)
+        raise _typer.Exit(code=1)
+
+    if not model:  # None (cancelled) or empty string
+        raise _typer.Exit(code=1)
+
+    return EmbeddingSettings(provider=provider, model=model.strip())
+
+
+def _ok_fail_tag(ok: bool) -> str:
+    """Return a colored `[OK]` or `[FAIL]` tag string."""
+    import click as _click
+
+    if ok:
+        return _click.style("[OK]", fg="green", bold=True)
+    return _click.style("[FAIL]", fg="red", bold=True)
+
+
+def _run_init_model_check(settings_path: Path) -> None:
+    """Ask the daemon to test the embedding model; print results and a hint on failure.
+
+    Drives the check via `DoctorRequest(project_root=None)`. The daemon loads
+    the model once and stays running, so the user's next `ccc index` starts
+    warm. Both DaemonStartError and generic exceptions are rendered as a
+    synthetic failed DoctorCheckResult — uniform failure-output shape.
+    """
+    from rich.console import Console as _Console
+    from rich.live import Live as _Live
+    from rich.spinner import Spinner as _Spinner
+
+    from . import client as _client
+    from .protocol import DoctorCheckResult
+
+    err_console = _Console(stderr=True)
+    results: list[DoctorCheckResult] = []
+    try:
+        with _Live(
+            _Spinner("dots", "Testing embedding model..."),
+            console=err_console,
+            transient=True,
+        ):
+            results = _client.doctor(project_root=None)
+    except Exception as e:
+        results = [
+            DoctorCheckResult(
+                name="Model Check",
+                ok=False,
+                details=[],
+                errors=[f"{type(e).__name__}: {e}"],
+            )
+        ]
+
+    failed = False
+    for r in results:
+        if r.name == "done":
+            continue
+        _print_doctor_result(r)
+        if not r.ok:
+            failed = True
+
+    if failed:
+        display_path = format_path_for_display(settings_path)
+        _typer.echo(
+            f"You can edit {display_path} to change the model or add API keys\n"
+            "under `envs:`. Then run `ccc doctor` to verify.",
+            err=True,
+        )
+
+
+def _setup_user_settings_interactive(litellm_model_flag: str | None) -> None:
+    """Interactive global-settings setup — only runs when settings are missing."""
+    from .embedder_defaults import lookup_defaults
+    from .shared import is_sentence_transformers_installed
+
+    embedding = _resolve_embedding_choice(
+        litellm_model_flag=litellm_model_flag,
+        st_installed=is_sentence_transformers_installed(),
+        tty=sys.stdin.isatty(),
+    )
+
+    # Apply curated defaults if the model is in our table.
+    indexing_defaults, query_defaults = lookup_defaults(embedding.provider, embedding.model)
+    defaults_applied = indexing_defaults is not None or query_defaults is not None
+    if defaults_applied:
+        embedding.indexing_params = indexing_defaults or {}
+        embedding.query_params = query_defaults or {}
+
+    path = save_initial_user_settings(embedding, defaults_applied=defaults_applied)
+    _typer.echo()
+    _typer.echo(f"Created user settings: {format_path_for_display(path)}")
+
+    if defaults_applied:
+        _typer.echo()
+        _typer.echo(f"Applied recommended defaults for {embedding.model}:")
+        _typer.echo(f"  indexing_params: {embedding.indexing_params}")
+        _typer.echo(f"  query_params:    {embedding.query_params}")
+
+    _typer.echo()
+    _typer.echo(f"Testing embedding model: {embedding.provider} / {embedding.model}")
+    _run_init_model_check(path)
+    _typer.echo()
+
+
 @app.command()
 def init(
+    litellm_model: str | None = _typer.Option(
+        None,
+        "--litellm-model",
+        help="Use the given LiteLLM model and skip provider/model prompts.",
+    ),
     force: bool = _typer.Option(False, "-f", "--force", help="Skip parent directory warning"),
 ) -> None:
     """Initialize a project for cocoindex-code."""
@@ -298,11 +498,18 @@ def init(
 
     settings_file = project_settings_path(cwd)
 
-    # Always ensure user settings exist
     user_path = user_settings_path()
-    if not user_path.is_file():
-        save_user_settings(default_user_settings())
-        _typer.echo(f"Created user settings: {user_path}")
+    if user_path.is_file():
+        if litellm_model is not None:
+            display_path = format_path_for_display(user_path)
+            _typer.echo(
+                f"Error: global settings already exist at {display_path}.\n"
+                "Edit that file or remove it before passing `--litellm-model`.",
+                err=True,
+            )
+            raise _typer.Exit(code=1)
+    else:
+        _setup_user_settings_interactive(litellm_model)
 
     # Check if already initialized
     if settings_file.is_file():
@@ -313,8 +520,9 @@ def init(
     if not force:
         parent = find_parent_with_marker(cwd)
         if parent is not None and parent != cwd:
+            display_parent = format_path_for_display(parent)
             _typer.echo(
-                f"Warning: A parent directory has a project marker: {parent}\n"
+                f"Warning: A parent directory has a project marker: {display_parent}\n"
                 "You might want to run `ccc init` there instead.\n"
                 "Use `ccc init -f` to initialize here anyway."
             )
@@ -322,7 +530,7 @@ def init(
 
     # Create project settings
     save_project_settings(cwd, default_project_settings())
-    _typer.echo(f"Created project settings: {settings_file}")
+    _typer.echo(f"Created project settings: {format_path_for_display(settings_file)}")
 
     # Add to .gitignore
     add_to_gitignore(cwd)
@@ -390,10 +598,10 @@ def status() -> None:
     project_root = str(project_root_path)
     print_project_header(project_root)
 
-    _typer.echo(f"Settings: {project_settings_path(project_root_path)}")
+    _typer.echo(f"Settings: {format_path_for_display(project_settings_path(project_root_path))}")
     db_path = target_sqlite_db_path(project_root_path)
     if db_path.exists():
-        _typer.echo(f"Index DB: {db_path}")
+        _typer.echo(f"Index DB: {format_path_for_display(db_path)}")
 
     print_index_stats(_client.project_status(project_root))
 
@@ -428,7 +636,7 @@ def reset(
     if to_delete:
         _typer.echo("The following files will be deleted:")
         for f in to_delete:
-            _typer.echo(f"  {f}")
+            _typer.echo(f"  {format_path_for_display(f)}")
 
     # Confirm
     if not force:
@@ -497,10 +705,7 @@ def _print_doctor_result(result: DoctorCheckResult) -> None:
 
     if result.name == "done":
         return
-    if result.ok:
-        tag = _click.style("[OK]", fg="green", bold=True)
-    else:
-        tag = _click.style("[FAIL]", fg="red", bold=True)
+    tag = _ok_fail_tag(result.ok)
     _typer.echo(f"\n  {tag} {result.name}")
     for line in result.details:
         _typer.echo(f"    {line}")
@@ -523,7 +728,7 @@ def doctor() -> None:
     # --- 1. Global settings (local, no daemon needed) ---
     _print_section("Global Settings")
     settings_path = user_settings_path()
-    _typer.echo(f"  Settings: {settings_path}")
+    _typer.echo(f"  Settings: {format_path_for_display(settings_path)}")
     try:
         user_settings = _load_user_settings()
         emb = user_settings.embedding
@@ -561,6 +766,10 @@ def doctor() -> None:
                 _typer.echo("  DB path mappings:")
                 for m in env_resp.db_path_mappings:
                     _typer.echo(f"    {m.source} \u2192 {m.target}")
+            if env_resp.host_path_mappings:
+                _typer.echo("  Host path mappings:")
+                for m in env_resp.host_path_mappings:
+                    _typer.echo(f"    {m.source} \u2192 {m.target}")
         except Exception as e:
             _print_error(f"Failed to get daemon env: {e}")
 
@@ -581,7 +790,7 @@ def doctor() -> None:
     if project_root is not None:
         _print_section("Project Settings")
         ps_path = project_settings_path(project_root)
-        _typer.echo(f"  Settings: {ps_path}")
+        _typer.echo(f"  Settings: {format_path_for_display(ps_path)}")
         try:
             ps = _load_project_settings(project_root)
             _typer.echo(f"  Include patterns ({len(ps.include_patterns)}):")
@@ -607,9 +816,9 @@ def doctor() -> None:
 
     # --- 8. Log files ---
     _print_section("Log Files")
-    from .daemon import daemon_log_path as _daemon_log_path
+    from ._daemon_paths import daemon_log_path as _daemon_log_path
 
-    _typer.echo(f"  Daemon logs: {_daemon_log_path()}")
+    _typer.echo(f"  Daemon logs: {format_path_for_display(_daemon_log_path())}")
     _typer.echo("  Check logs above for further troubleshooting.")
 
 
@@ -660,7 +869,7 @@ def daemon_status() -> None:
         _typer.echo("Projects:")
         for p in resp.projects:
             state = "indexing" if p.indexing else "idle"
-            _typer.echo(f"  {p.project_root} [{state}]")
+            _typer.echo(f"  {format_path_for_display(p.project_root)} [{state}]")
     else:
         _typer.echo("No projects loaded.")
 
@@ -683,8 +892,8 @@ def daemon_restart() -> None:
 @daemon_app.command("stop")
 def daemon_stop() -> None:
     """Stop the daemon."""
+    from ._daemon_paths import daemon_pid_path
     from .client import is_daemon_running, stop_daemon
-    from .daemon import daemon_pid_path
 
     pid_path = daemon_pid_path()
     if not pid_path.exists() and not is_daemon_running():

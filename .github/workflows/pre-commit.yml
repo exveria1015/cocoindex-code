@@ -9,6 +9,9 @@ on:
 jobs:
   pre-commit:
     runs-on: ${{ matrix.os }}
+    # Free-threaded Python (3.14t) lacks pre-built wheels for tokenizers;
+    # the fallback source build is fragile across macOS toolchain updates.
+    continue-on-error: ${{ matrix.python-version == '3.14t' }}
     strategy:
       fail-fast: false
       matrix:
@@ -17,6 +20,14 @@ jobs:
         exclude:
           # pywin32 doesn't have wheels for Python 3.14t (free-threaded) on Windows yet
           - os: windows-latest
+            python-version: '3.14t'
+          # tokenizers has no free-threaded wheel; the source-build fallback
+          # fails to link on macOS arm64 since an Apr 2026 runner-image update.
+          # Standard Python 3.14 (non-FT) users are unaffected — they pick up
+          # tokenizers' abi3 wheel. Re-enable once HuggingFace/tokenizers ships
+          # free-threaded wheels (or switch to a newer litellm that drops the
+          # tokenizers dep).
+          - os: macos-latest
             python-version: '3.14t'
     steps:
       - uses: actions/checkout@v4

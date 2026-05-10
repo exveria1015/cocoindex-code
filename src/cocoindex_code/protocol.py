@@ -71,6 +71,9 @@ class HandshakeResponse(_msgspec.Struct, tag="handshake"):
     ok: bool
     daemon_version: str
     global_settings_mtime_us: int | None = None
+    # Non-fatal daemon-side warnings surfaced to the client on every handshake.
+    # The client dedupes and prints them to stderr (see client._print_handshake_warnings).
+    warnings: list[str] = []
 
 
 class IndexResponse(_msgspec.Struct, tag="index"):
@@ -167,6 +170,7 @@ class DaemonEnvResponse(_msgspec.Struct, tag="daemon_env"):
     env_names: list[str]
     settings_env_names: list[str]
     db_path_mappings: list[DbPathMappingEntry] = []
+    host_path_mappings: list[DbPathMappingEntry] = []
 
 
 class ErrorResponse(_msgspec.Struct, tag="error"):

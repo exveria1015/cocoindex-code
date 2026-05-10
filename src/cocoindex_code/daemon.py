@@ -15,8 +15,16 @@ from multiprocessing.connection import Connection, Listener
 from pathlib import Path
 from typing import Any
 
+from ._daemon_paths import (
+    connection_family,
+    daemon_log_path,
+    daemon_pid_path,
+    daemon_runtime_dir,
+    daemon_socket_path,
+)
 from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
+from .embedder_params import resolve_embedder_params
 from .project import Project
 from .protocol import (
     DaemonEnvRequest,
@@ -49,15 +57,39 @@ from .protocol import (
 )
 from .settings import (
     ChunkerMapping,
+    UserSettings,
+    format_path_for_display,
+    get_host_path_mappings,
     global_settings_mtime_us,
     load_project_settings,
     load_user_settings,
     target_sqlite_db_path,
-    user_settings_dir,
+    user_settings_path,
 )
-from .shared import Embedder, create_embedder
+from .shared import Embedder, check_embedding, create_embedder
 
 logger = logging.getLogger(__name__)
+
+
+def _build_backward_compat_warning(
+    user_settings: UserSettings,
+    settings_path: Path,
+) -> str:
+    """Compose the one-time handshake warning for legacy-bridge models.
+
+    Fired when a user's settings omit ``indexing_params`` / ``query_params`` for
+    a model that was previously hardcoded to use ``prompt_name="query"`` for
+    queries.  See embedder_defaults.LEGACY_QUERY_PROMPT_MODELS.
+    """
+    return (
+        f"Your embedding model ({user_settings.embedding.model}) was previously "
+        f'hardcoded to use prompt_name="query" for queries. Add the following to '
+        f"{settings_path} to keep this behavior and silence this warning:\n"
+        f"\n"
+        f"  embedding:\n"
+        f"    query_params:\n"
+        f"      prompt_name: query\n"
+    )
 
 
 def _resolve_chunker_registry(mappings: list[ChunkerMapping]) -> dict[str, _ChunkerFn]:
@@ -80,64 +112,53 @@ def _resolve_chunker_registry(mappings: list[ChunkerMapping]) -> dict[str, _Chun
 
 
 # ---------------------------------------------------------------------------
-# Daemon paths
-# ---------------------------------------------------------------------------
-
-
-def daemon_dir() -> Path:
-    """Return the daemon directory (``~/.cocoindex_code/``)."""
-    return user_settings_dir()
-
-
-def _connection_family() -> str:
-    """Return the multiprocessing connection family for this platform."""
-    return "AF_PIPE" if sys.platform == "win32" else "AF_UNIX"
-
-
-def daemon_socket_path() -> str:
-    """Return the daemon socket/pipe address."""
-    if sys.platform == "win32":
-        import hashlib
-
-        # Hash the daemon dir so COCOINDEX_CODE_DIR overrides create unique pipe names,
-        # preventing conflicts between different daemon instances (tests, users, etc.)
-        dir_hash = hashlib.md5(str(daemon_dir()).encode()).hexdigest()[:12]
-        return rf"\\.\pipe\cocoindex_code_{dir_hash}"
-    return str(daemon_dir() / "daemon.sock")
-
-
-def daemon_pid_path() -> Path:
-    """Return the path for the daemon's PID file."""
-    return daemon_dir() / "daemon.pid"
-
-
-def daemon_log_path() -> Path:
-    """Return the path for the daemon's log file."""
-    return daemon_dir() / "daemon.log"
-
-
-# ---------------------------------------------------------------------------
 # Project Registry
 # ---------------------------------------------------------------------------
 
 
 class ProjectRegistry:
-    """Cache of loaded projects, keyed by project root path."""
+    """Cache of loaded projects, keyed by project root path.
+
+    ``_embedder`` is ``None`` when the daemon is running in "no-settings mode"
+    (started before ``global_settings.yml`` existed). In that state
+    ``get_project`` raises an error pointing the user at ``ccc init``; the
+    daemon still serves handshakes so the client can detect the mtime
+    mismatch once the file is created and trigger a supervisor respawn.
+    """
 
     _projects: dict[str, Project]
-    _embedder: Embedder
+    _embedder: Embedder | None
+    indexing_params: dict[str, Any]
+    query_params: dict[str, Any]
 
-    def __init__(self, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        embedder: Embedder | None,
+        indexing_params: dict[str, Any] | None = None,
+        query_params: dict[str, Any] | None = None,
+    ) -> None:
         self._projects = {}
         self._embedder = embedder
+        self.indexing_params = dict(indexing_params) if indexing_params else {}
+        self.query_params = dict(query_params) if query_params else {}
 
     async def get_project(self, project_root: str) -> Project:
         """Get or create a Project for the given root. Lazy initialization."""
+        if self._embedder is None:
+            raise RuntimeError(
+                "Daemon has no global settings loaded. Run `ccc init` to set up cocoindex-code."
+            )
         if project_root not in self._projects:
             root = Path(project_root)
             project_settings = load_project_settings(root)
             chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
-            project = await Project.create(root, self._embedder, chunker_registry=chunker_registry)
+            project = await Project.create(
+                root,
+                self._embedder,
+                indexing_params=self.indexing_params,
+                query_params=self.query_params,
+                chunker_registry=chunker_registry,
+            )
             self._projects[project_root] = project
         return self._projects[project_root]
 
@@ -185,6 +206,7 @@ async def handle_connection(
     on_shutdown: Callable[[], None],
     settings_mtime_us: int | None,
     settings_env_names: list[str],
+    handshake_warnings: list[str],
 ) -> None:
     """Handle a single client connection (per-request model).
 
@@ -210,6 +232,7 @@ async def handle_connection(
                     ok=ok,
                     daemon_version=__version__,
                     global_settings_mtime_us=settings_mtime_us,
+                    warnings=list(handshake_warnings),
                 )
             )
         )
@@ -277,8 +300,19 @@ async def _handle_doctor(
     appear before project settings in the output.
     """
     if req.project_root is None:
-        # Global-scope checks
-        yield DoctorResponse(result=await _check_model(registry._embedder))
+        # Global-scope checks — two separate embed calls because indexing and
+        # query may pass different kwargs (asymmetric embedding models), and
+        # either side can fail independently (e.g. a malformed input_type).
+        yield DoctorResponse(
+            result=await _check_model(
+                registry._embedder, label="indexing", params=registry.indexing_params
+            )
+        )
+        yield DoctorResponse(
+            result=await _check_model(
+                registry._embedder, label="query", params=registry.query_params
+            )
+        )
     else:
         # Project-scope checks
         yield DoctorResponse(result=await _check_file_walk(req.project_root))
@@ -291,24 +325,41 @@ async def _handle_doctor(
     )
 
 
-async def _check_model(embedder: Embedder) -> DoctorCheckResult:
-    """Test the embedding model by embedding a short string."""
-    try:
-        vec = await embedder.embed("hello world")
-        dim = len(vec)
+async def _check_model(
+    embedder: Embedder | None,
+    label: str,
+    params: dict[str, Any],
+) -> DoctorCheckResult:
+    """Test the embedding model by embedding a short string using *params*.
+
+    *label* appears in the check's name (e.g. ``"indexing"`` / ``"query"``) so
+    users see which side of the config the result corresponds to.  Returns a
+    failed result when the embedder is ``None`` (daemon running in no-settings
+    mode).
+    """
+    name = f"Model Check ({label})"
+    if embedder is None:
         return DoctorCheckResult(
-            name="Model Check",
-            ok=True,
-            details=[f"Embedding dimension: {dim}"],
-            errors=[],
-        )
-    except Exception as e:
-        return DoctorCheckResult(
-            name="Model Check",
+            name=name,
             ok=False,
             details=[],
-            errors=[str(e)],
+            errors=["Daemon has no global settings loaded. Run `ccc init` to set up."],
         )
+    result = await check_embedding(embedder, params)
+    params_detail = f"params: {params}" if params else "params: {} (no extra kwargs)"
+    if result.error is None:
+        return DoctorCheckResult(
+            name=name,
+            ok=True,
+            details=[params_detail, f"Embedding dimension: {result.dim}"],
+            errors=[],
+        )
+    return DoctorCheckResult(
+        name=name,
+        ok=False,
+        details=[params_detail],
+        errors=[result.error],
+    )
 
 
 async def _check_file_walk(project_root_str: str) -> DoctorCheckResult:
@@ -373,7 +424,7 @@ async def _check_index_status(project_root_str: str) -> DoctorCheckResult:
 
     project_root = Path(project_root_str)
     db_path = target_sqlite_db_path(project_root)
-    details = [f"Index: {db_path}"]
+    details = [f"Index: {format_path_for_display(db_path)}"]
 
     if not db_path.exists():
         details.append("Index not created yet.")
@@ -478,6 +529,10 @@ async def _dispatch(
                     DbPathMappingEntry(source=str(m.source), target=str(m.target))
                     for m in get_db_path_mappings()
                 ],
+                host_path_mappings=[
+                    DbPathMappingEntry(source=str(m.source), target=str(m.target))
+                    for m in get_host_path_mappings()
+                ],
             )
 
         if isinstance(req, DoctorRequest):
@@ -501,19 +556,40 @@ def run_daemon() -> None:
     to serve connections, and performs cleanup when shutdown is requested via
     ``StopRequest`` or a signal (SIGTERM / SIGINT).
     """
-    daemon_dir().mkdir(parents=True, exist_ok=True)
+    daemon_runtime_dir().mkdir(parents=True, exist_ok=True)
 
-    # Load user settings and record mtime for staleness detection
-    user_settings = load_user_settings()
-    settings_mtime_us = global_settings_mtime_us()
-
-    # Set environment variables from settings
-    settings_env_keys = list(user_settings.envs.keys())
-    for key, value in user_settings.envs.items():
-        os.environ[key] = value
-
-    # Create embedder
-    embedder = create_embedder(user_settings.embedding)
+    # No-settings mode: start even when global_settings.yml is missing so the
+    # client can complete its handshake, detect the mtime mismatch once
+    # `ccc init` writes the file, and trigger a supervisor respawn. The
+    # alternative (auto-creating defaults) would skip the interactive
+    # provider/model picker in `ccc init`.
+    settings_mtime_us = global_settings_mtime_us()  # None when file is missing
+    embedder: Embedder | None
+    indexing_params: dict[str, Any] = {}
+    query_params: dict[str, Any] = {}
+    handshake_warnings: list[str] = []
+    if user_settings_path().is_file():
+        user_settings = load_user_settings()
+        settings_env_keys = list(user_settings.envs.keys())
+        for key, value in user_settings.envs.items():
+            os.environ[key] = value
+        # Resolve params BEFORE constructing the embedder so invalid configs
+        # fail fast without paying the model-load cost.
+        try:
+            embedder_params = resolve_embedder_params(user_settings.embedding)
+        except ValueError:
+            logger.exception("Invalid embedder params in global_settings.yml")
+            sys.exit(1)
+        indexing_params = embedder_params.indexing
+        query_params = embedder_params.query
+        if embedder_params.used_backward_compat:
+            handshake_warnings.append(
+                _build_backward_compat_warning(user_settings, user_settings_path())
+            )
+        embedder = create_embedder(user_settings.embedding, indexing_params=indexing_params)
+    else:
+        settings_env_keys = []
+        embedder = None
 
     # Write PID file
     pid_path = daemon_pid_path()
@@ -531,7 +607,11 @@ def run_daemon() -> None:
     logger.info("Daemon starting (PID %d, version %s)", os.getpid(), __version__)
 
     start_time = time.monotonic()
-    registry = ProjectRegistry(embedder)
+    registry = ProjectRegistry(
+        embedder,
+        indexing_params=indexing_params,
+        query_params=query_params,
+    )
 
     sock_path = daemon_socket_path()
     if sys.platform != "win32":
@@ -540,7 +620,7 @@ def run_daemon() -> None:
         except Exception:
             pass
 
-    listener = Listener(sock_path, family=_connection_family())
+    listener = Listener(sock_path, family=connection_family())
     logger.info("Listening on %s", sock_path)
 
     loop = asyncio.new_event_loop()
@@ -559,6 +639,7 @@ def run_daemon() -> None:
                 _request_shutdown,
                 settings_mtime_us,
                 settings_env_keys,
+                handshake_warnings,
             )
         )
         tasks.add(task)

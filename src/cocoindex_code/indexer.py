@@ -7,6 +7,7 @@ import bisect
 import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path, PurePath
+from typing import Any
 
 import cocoindex as coco
 from cocoindex.connectors import localfs, sqlite
@@ -22,6 +23,7 @@ from .settings import load_gitignore_spec, load_project_settings
 from .shared import (
     CODEBASE_DIR,
     EMBEDDER,
+    INDEXING_EMBED_PARAMS,
     SQLITE_DB,
     CodeChunk,
     Embedder,
@@ -277,6 +279,7 @@ async def _declare_chunk_batch(
     language: str,
     id_gen: IdGenerator,
     embedder: Embedder,
+    indexing_params: dict[str, Any],
     table: sqlite.TableTarget[CodeChunk],
 ) -> None:
     """Embed and declare a bounded batch of chunks."""
@@ -284,7 +287,9 @@ async def _declare_chunk_batch(
     for chunk in chunks:
         pending_chunks.append((await id_gen.next_id(chunk.text), chunk))
 
-    embeddings = await asyncio.gather(*(embedder.embed(chunk.text) for _, chunk in pending_chunks))
+    embeddings = await asyncio.gather(
+        *(embedder.embed(chunk.text, **indexing_params) for _, chunk in pending_chunks)
+    )
 
     for (chunk_id, chunk), embedding in zip(pending_chunks, embeddings, strict=True):
         table.declare_row(
@@ -307,6 +312,7 @@ async def process_file(
 ) -> None:
     """Process a single file: chunk, embed, and store."""
     embedder = coco.use_context(EMBEDDER)
+    indexing_params = coco.use_context(INDEXING_EMBED_PARAMS)
 
     try:
         content = await file.read_text()
@@ -344,6 +350,7 @@ async def process_file(
             language=language,
             id_gen=id_gen,
             embedder=embedder,
+            indexing_params=indexing_params,
             table=table,
         )
 

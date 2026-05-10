@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from cocoindex_code import cli
 from cocoindex_code.cli import (
     add_to_gitignore,
     app,
@@ -157,3 +158,138 @@ def test_remove_from_gitignore_no_entry(tmp_path: Path) -> None:
     gitignore.write_text(original)
     remove_from_gitignore(tmp_path)
     assert gitignore.read_text() == original
+
+
+# ---------------------------------------------------------------------------
+# COCOINDEX_CODE_HOST_CWD callback
+# ---------------------------------------------------------------------------
+
+
+def test_apply_host_cwd_chdirs_to_mapped_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When COCOINDEX_CODE_HOST_CWD is set and matches the mapping, chdir to container form."""
+    from cocoindex_code.cli import _apply_host_cwd
+    from cocoindex_code.settings import _reset_host_path_mapping_cache
+
+    container = tmp_path / "workspace"
+    host = tmp_path / "host-home"
+    (container / "proj" / "src").mkdir(parents=True)
+    host.mkdir()
+
+    _reset_host_path_mapping_cache()
+    monkeypatch.setenv("COCOINDEX_CODE_HOST_PATH_MAPPING", f"{container}={host}")
+    monkeypatch.setenv("COCOINDEX_CODE_HOST_CWD", str(host / "proj" / "src"))
+
+    _apply_host_cwd()
+
+    # chdir resolves symlinks; compare resolved forms.
+    assert Path.cwd().resolve() == (container / "proj" / "src").resolve()
+    assert capsys.readouterr().err == ""
+
+    _reset_host_path_mapping_cache()
+
+
+def test_apply_host_cwd_warns_on_invalid_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An invalid COCOINDEX_CODE_HOST_CWD emits a warning but doesn't abort."""
+    from cocoindex_code.cli import _apply_host_cwd
+
+    original_cwd = Path.cwd()
+    monkeypatch.setenv("COCOINDEX_CODE_HOST_CWD", "/nonexistent/path/xyz")
+    monkeypatch.delenv("COCOINDEX_CODE_HOST_PATH_MAPPING", raising=False)
+
+    _apply_host_cwd()
+
+    captured = capsys.readouterr()
+    assert "COCOINDEX_CODE_HOST_CWD" in captured.err
+    assert "/nonexistent/path/xyz" in captured.err
+    # cwd should be unchanged since chdir failed.
+    assert Path.cwd() == original_cwd
+
+
+def test_apply_host_cwd_noop_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With COCOINDEX_CODE_HOST_CWD unset, the callback is a silent no-op."""
+    from cocoindex_code.cli import _apply_host_cwd
+
+    original_cwd = Path.cwd()
+    monkeypatch.delenv("COCOINDEX_CODE_HOST_CWD", raising=False)
+
+    _apply_host_cwd()
+
+    assert Path.cwd() == original_cwd
+    assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# ccc init — auto-populate indexing_params / query_params from curated table
+# ---------------------------------------------------------------------------
+
+
+def test_init_auto_populates_known_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """For a known model, `ccc init` writes real indexing/query params into the
+    file and prints an 'Applied recommended defaults' message.
+    """
+    from cocoindex_code.settings import EmbeddingSettings, load_user_settings
+
+    user_dir = tmp_path / ".cocoindex_code"
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(user_dir))
+
+    monkeypatch.setattr(
+        cli,
+        "_resolve_embedding_choice",
+        lambda **_kw: EmbeddingSettings(provider="litellm", model="cohere/embed-english-v3.0"),
+    )
+    monkeypatch.setattr(cli, "_run_init_model_check", lambda path: None)
+
+    cli._setup_user_settings_interactive(litellm_model_flag=None)
+
+    loaded = load_user_settings()
+    assert loaded.embedding.provider == "litellm"
+    assert loaded.embedding.model == "cohere/embed-english-v3.0"
+    assert loaded.embedding.indexing_params == {"input_type": "search_document"}
+    assert loaded.embedding.query_params == {"input_type": "search_query"}
+
+    out = capsys.readouterr().out
+    assert "Applied recommended defaults" in out
+
+
+def test_init_writes_comment_template_for_unknown_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """For a model outside the curated table, `ccc init` writes a commented-out
+    template block under ``embedding:`` instead of real keys.
+    """
+    from cocoindex_code.settings import (
+        EmbeddingSettings,
+        load_user_settings,
+        user_settings_path,
+    )
+
+    user_dir = tmp_path / ".cocoindex_code"
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(user_dir))
+
+    monkeypatch.setattr(
+        cli,
+        "_resolve_embedding_choice",
+        lambda **_kw: EmbeddingSettings(provider="litellm", model="someprovider/unknown-model"),
+    )
+    monkeypatch.setattr(cli, "_run_init_model_check", lambda path: None)
+
+    cli._setup_user_settings_interactive(litellm_model_flag=None)
+
+    content = user_settings_path().read_text()
+    # Commented template present, no populated keys
+    assert "# indexing_params: {}" in content
+    assert "# query_params: {}" in content
+    loaded = load_user_settings()
+    assert loaded.embedding.indexing_params is None
+    assert loaded.embedding.query_params is None
