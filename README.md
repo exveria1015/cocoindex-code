@@ -123,7 +123,7 @@ Or use opencode.json:
 ```
 </details>
 
-Once configured, the agent automatically decides when semantic code search is helpful — finding code by description, exploring unfamiliar codebases, fuzzy/conceptual matches, or locating implementations without knowing exact names.
+Once configured, the agent automatically decides when hybrid code search is helpful — finding code by description, exploring unfamiliar codebases, fuzzy/conceptual matches, exact identifier matches, or locating implementations without knowing exact names.
 
 > **Note:** The `cocoindex-code` command (without subcommand) still works as an MCP server for backward compatibility. It auto-creates settings from environment variables on first run.
 
@@ -132,7 +132,7 @@ Once configured, the agent automatically decides when semantic code search is he
 
 When running as an MCP server (`ccc mcp`), the following tool is exposed:
 
-**`search`** — Search the codebase using semantic similarity.
+**`search`** — Search the codebase using hybrid semantic and lexical retrieval.
 
 ```
 search(
@@ -145,7 +145,7 @@ search(
 )
 ```
 
-Returns matching code chunks with file path, language, code content, line numbers, and similarity score.
+Returns matching code chunks with file path, language, code content, line numbers, and a normalized hybrid relevance score.
 </details>
 
 ## Manual CLI Usage

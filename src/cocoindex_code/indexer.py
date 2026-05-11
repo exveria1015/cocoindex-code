@@ -6,6 +6,7 @@ import asyncio
 import bisect
 import codecs
 import os
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -44,6 +45,20 @@ MAX_FILE_READ_BYTES_ENV = "COCOINDEX_CODE_MAX_FILE_READ_BYTES"
 
 # Chunking splitter (stateless, can be module-level)
 splitter = RecursiveSplitter()
+
+_SYMBOL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE),
+    re.compile(r"^\s*class\s+([A-Za-z_]\w*)\b", re.MULTILINE),
+    re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", re.MULTILINE),
+    re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b", re.MULTILINE),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+        re.MULTILINE,
+    ),
+    re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\(", re.MULTILINE),
+    re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE),
+)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -346,6 +361,33 @@ def _iter_chunk_batches(chunks: Iterable[Chunk], batch_size: int) -> Iterator[li
         yield batch
 
 
+def _symbol_names_for_chunk(text: str) -> list[str]:
+    """Return likely symbol names declared in a chunk."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for pattern in _SYMBOL_PATTERNS:
+        for match in pattern.finditer(text):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _embedding_text_for_chunk(*, file_path: str, language: str, chunk: Chunk) -> str:
+    """Build embedding input with code metadata while preserving raw stored content."""
+    metadata = [
+        f"path: {file_path}",
+        f"language: {language}",
+        f"lines: {chunk.start.line}-{chunk.end.line}",
+    ]
+    symbols = _symbol_names_for_chunk(chunk.text)
+    if symbols:
+        metadata.append(f"symbols: {', '.join(symbols)}")
+    return "\n".join([*metadata, "code:", chunk.text])
+
+
 async def _declare_chunk_batch(
     *,
     chunks: list[Chunk],
@@ -357,15 +399,23 @@ async def _declare_chunk_batch(
     table: sqlite.TableTarget[CodeChunk],
 ) -> None:
     """Embed and declare a bounded batch of chunks."""
-    pending_chunks: list[tuple[int, Chunk]] = []
+    pending_chunks: list[tuple[int, Chunk, str]] = []
     for chunk in chunks:
-        pending_chunks.append((await id_gen.next_id(chunk.text), chunk))
+        embedding_text = _embedding_text_for_chunk(
+            file_path=file_path,
+            language=language,
+            chunk=chunk,
+        )
+        pending_chunks.append((await id_gen.next_id(chunk.text), chunk, embedding_text))
 
     embeddings = await asyncio.gather(
-        *(embedder.embed(chunk.text, **indexing_params) for _, chunk in pending_chunks)
+        *(
+            embedder.embed(embedding_text, **indexing_params)
+            for _, _, embedding_text in pending_chunks
+        )
     )
 
-    for (chunk_id, chunk), embedding in zip(pending_chunks, embeddings, strict=True):
+    for (chunk_id, chunk, _), embedding in zip(pending_chunks, embeddings, strict=True):
         table.declare_row(
             row=CodeChunk(
                 id=chunk_id,
@@ -379,7 +429,7 @@ async def _declare_chunk_batch(
         )
 
 
-@coco.fn(memo=True)
+@coco.fn(memo=True, version=2)
 async def process_file(
     file: IndexableFile,
     table: sqlite.TableTarget[CodeChunk],

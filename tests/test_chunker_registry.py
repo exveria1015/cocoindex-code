@@ -46,13 +46,26 @@ class _StubEmbedder:
         return np.zeros(_EMBED_DIM, dtype=np.float32)
 
 
+class _RecordingEmbedder(_StubEmbedder):
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def __coco_memo_key__(self) -> str:
+        return "recording-embedder"
+
+    async def embed(self, text: str, **kwargs: Any) -> np.ndarray:
+        self.texts.append(text)
+        return np.zeros(_EMBED_DIM, dtype=np.float32)
+
+
 async def _index_project(
     project_root: Path,
+    embedder: Any | None = None,
     **create_kwargs: Any,
 ) -> Project:
     """Create a Project and run a full index pass."""
     settings = ProjectSettings(include_patterns=["**/*.*"], exclude_patterns=["**/.cocoindex_code"])
-    stub = _StubEmbedder()
+    stub = embedder or _StubEmbedder()
     save_project_settings(project_root, settings)
     project = await Project.create(
         project_root,
@@ -246,6 +259,44 @@ async def test_file_reads_are_bounded_and_do_not_use_read_text_cache(
 
     assert any("small" in c["content"] for c in chunks)
     assert not any("large" in c["content"] for c in chunks)
+
+
+async def test_embedding_text_includes_metadata_but_stores_raw_content(tmp_path: Path) -> None:
+    """Embedding input should include metadata while the result content stays raw."""
+    (tmp_path / ".git").mkdir()
+    source = "class SearchService:\n    def find_user(self):\n        return 1\n"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "search.py").write_text(source)
+
+    embedder = _RecordingEmbedder()
+    await _index_project(tmp_path, embedder=embedder)
+    chunks = _query_chunks(tmp_path)
+
+    assert chunks
+    assert any("SearchService" in c["content"] for c in chunks)
+    assert all("path: src/search.py" not in c["content"] for c in chunks)
+    indexed_text = "\n".join(embedder.texts)
+    assert "path: src/search.py" in indexed_text
+    assert "language: python" in indexed_text
+    assert (
+        "symbols: find_user, SearchService" in indexed_text
+        or "symbols: SearchService, find_user" in indexed_text
+    )
+    assert "code:\nclass SearchService" in indexed_text
+
+
+async def test_hybrid_search_uses_lexical_identifier_matches(tmp_path: Path) -> None:
+    """Exact identifier matches should rank highly even when vectors are indistinguishable."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "alpha.py").write_text("def common_alpha():\n    return 'alpha'\n")
+    (tmp_path / "needle.py").write_text("def specialIdentifier():\n    return 'needle'\n")
+
+    project = await _index_project(tmp_path)
+    results = await project.search("specialIdentifier", limit=2)
+
+    assert results
+    assert results[0].file_path == "needle.py"
+    assert "specialIdentifier" in results[0].content
 
 
 async def test_project_aclose_cancels_background_index_task(

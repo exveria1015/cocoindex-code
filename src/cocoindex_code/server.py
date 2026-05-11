@@ -23,9 +23,8 @@ _MCP_INSTRUCTIONS = (
     "Use when you need to find code, understand how something works,"
     " locate implementations, or explore an unfamiliar codebase."
     "\n"
-    "Provides semantic search that understands meaning --"
-    " unlike grep or text matching,"
-    " it finds relevant code even when exact keywords are unknown."
+    "Provides hybrid semantic and lexical search that understands meaning"
+    " while still rewarding exact identifier and path matches."
 )
 
 
@@ -40,7 +39,7 @@ class CodeChunkResult(BaseModel):
     content: str = Field(description="The code content")
     start_line: int = Field(description="Starting line number (1-indexed)")
     end_line: int = Field(description="Ending line number (1-indexed)")
-    score: float = Field(description="Similarity score (0-1, higher is better)")
+    score: float = Field(description="Hybrid relevance score (0-1, higher is better)")
 
 
 class SearchResultModel(BaseModel):
@@ -63,8 +62,8 @@ def create_mcp_server(project_root: str) -> FastMCP:
     @mcp.tool(
         name="search",
         description=(
-            "Semantic code search across the entire codebase"
-            " -- finds code by meaning, not just text matching."
+            "Hybrid semantic and lexical code search across the entire codebase"
+            " -- finds code by meaning while also rewarding exact identifiers and paths."
             " Use this instead of grep/glob when you need to find implementations,"
             " understand how features work,"
             " or locate related code without knowing exact names or keywords."
