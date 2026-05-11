@@ -48,10 +48,41 @@ class Project:
     _project_root: Path
     _index_lock: asyncio.Lock
     _initial_index_done: asyncio.Event
+    _index_tasks: set[asyncio.Task[None]]
+    _initial_index_task: asyncio.Task[None] | None
+    _initial_index_started: asyncio.Event | None
+    _closed: bool
     _indexing_stats: IndexingProgress | None = None
 
     def close(self) -> None:
-        """Close project resources to release file handles (LMDB, SQLite)."""
+        """Synchronously close project resources.
+
+        Prefer :meth:`aclose` from async daemon paths so background indexing
+        tasks can be cancelled and awaited before file handles are released.
+        This fallback is intentionally best-effort for synchronous callers.
+        """
+        self._closed = True
+        for task in list(self._index_tasks):
+            if not task.done():
+                task.cancel()
+        self._close_db()
+
+    async def aclose(self) -> None:
+        """Cancel background indexing and close project resources."""
+        self._closed = True
+        tasks = [task for task in self._index_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._index_tasks.clear()
+        self._initial_index_task = None
+        self._initial_index_started = None
+        self._close_db()
+
+    def _close_db(self) -> None:
+        """Close the target SQLite connection if it has been created."""
         try:
             db = self._env.get_context(SQLITE_DB)
             db.close()
@@ -73,6 +104,9 @@ class Project:
         (i.e. indexing has truly begun).  On completion (success or failure)
         ``_initial_index_done`` is set.
         """
+        if self._closed:
+            raise RuntimeError("Project is closed")
+
         async with self._index_lock:
             self._indexing_stats = IndexingProgress(
                 num_execution_starts=0,
@@ -112,6 +146,24 @@ class Project:
             self._initial_index_done.set()
             self._indexing_stats = None
 
+    def _create_index_task(
+        self,
+        *,
+        on_progress: Callable[[IndexingProgress], None] | None = None,
+        on_started: asyncio.Event | None = None,
+    ) -> asyncio.Task[None]:
+        """Create and track a background indexing task."""
+        task = asyncio.create_task(self.run_index(on_progress=on_progress, on_started=on_started))
+        self._index_tasks.add(task)
+
+        def _done(done: asyncio.Task[None]) -> None:
+            self._index_tasks.discard(done)
+            if on_started is not None and not on_started.is_set():
+                on_started.set()
+
+        task.add_done_callback(_done)
+        return task
+
     async def ensure_indexing_started(self) -> None:
         """Kick off background indexing and wait until it has actually started.
 
@@ -119,10 +171,28 @@ class Project:
         times — only the first call spawns a task; subsequent calls return
         immediately.
         """
+        if self._closed:
+            raise RuntimeError("Project is closed")
         if self._initial_index_done.is_set() or self._index_lock.locked():
             return
-        started = asyncio.Event()
-        asyncio.create_task(self.run_index(on_started=started))
+        task = self._initial_index_task
+        started = self._initial_index_started
+        if task is None or task.done():
+            started = asyncio.Event()
+            task = self._create_index_task(on_started=started)
+            self._initial_index_task = task
+            self._initial_index_started = started
+
+            def _clear_initial(done: asyncio.Task[None]) -> None:
+                if self._initial_index_task is done:
+                    self._initial_index_task = None
+                if self._initial_index_started is started:
+                    self._initial_index_started = None
+
+            task.add_done_callback(_clear_initial)
+
+        if started is None:
+            return
         await started.wait()
 
     async def stream_index(self) -> AsyncIterator[IndexStreamResponse]:
@@ -132,13 +202,25 @@ class Project:
         The actual indexing runs in a separate task so that client disconnects
         (``GeneratorExit``) do not abort the indexing.
         """
+        if self._closed:
+            yield IndexResponse(success=False, message="Project is closed")
+            return
+
         if self._index_lock.locked():
             yield IndexWaitingNotice()
 
-        progress_queue: asyncio.Queue[IndexingProgress] = asyncio.Queue()
-        index_task = asyncio.create_task(
-            self.run_index(on_progress=lambda p: progress_queue.put_nowait(p))
-        )
+        progress_queue: asyncio.Queue[IndexingProgress] = asyncio.Queue(maxsize=128)
+        stream_open = True
+
+        def _on_progress(progress: IndexingProgress) -> None:
+            if not stream_open:
+                return
+            try:
+                progress_queue.put_nowait(progress)
+            except asyncio.QueueFull:
+                pass
+
+        index_task = self._create_index_task(on_progress=_on_progress)
 
         try:
             while not index_task.done():
@@ -157,6 +239,8 @@ class Project:
             return
         except Exception as e:
             yield IndexResponse(success=False, message=str(e))
+        finally:
+            stream_open = False
 
     # ------------------------------------------------------------------
     # Search
@@ -245,6 +329,10 @@ class Project:
     # ------------------------------------------------------------------
 
     @property
+    def is_indexing(self) -> bool:
+        return self._index_lock.locked() or any(not task.done() for task in self._index_tasks)
+
+    @property
     def indexing_stats(self) -> IndexingProgress | None:
         return self._indexing_stats
 
@@ -316,4 +404,8 @@ class Project:
         result._project_root = project_root
         result._index_lock = asyncio.Lock()
         result._initial_index_done = asyncio.Event()
+        result._index_tasks = set()
+        result._initial_index_task = None
+        result._initial_index_started = None
+        result._closed = False
         return result

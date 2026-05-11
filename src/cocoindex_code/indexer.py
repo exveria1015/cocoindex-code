@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import codecs
 import os
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any
 
@@ -35,8 +37,10 @@ MIN_CHUNK_SIZE = 250
 CHUNK_OVERLAP = 150
 DEFAULT_CHUNK_EMBED_BATCH_SIZE = 64
 DEFAULT_MAX_RECURSIVE_SPLIT_BYTES = 1_000_000
+DEFAULT_MAX_FILE_READ_BYTES = 5_000_000
 CHUNK_EMBED_BATCH_SIZE_ENV = "COCOINDEX_CODE_CHUNK_EMBED_BATCH_SIZE"
 MAX_RECURSIVE_SPLIT_BYTES_ENV = "COCOINDEX_CODE_MAX_RECURSIVE_SPLIT_BYTES"
+MAX_FILE_READ_BYTES_ENV = "COCOINDEX_CODE_MAX_FILE_READ_BYTES"
 
 # Chunking splitter (stateless, can be module-level)
 splitter = RecursiveSplitter()
@@ -66,6 +70,76 @@ def _max_recursive_split_bytes() -> int:
         DEFAULT_MAX_RECURSIVE_SPLIT_BYTES,
         minimum=1,
     )
+
+
+def _max_file_read_bytes() -> int:
+    """Maximum source file bytes to read into memory for indexing."""
+    return _int_env(MAX_FILE_READ_BYTES_ENV, DEFAULT_MAX_FILE_READ_BYTES, minimum=1)
+
+
+_BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+)
+
+
+@dataclass(frozen=True)
+class IndexableFile:
+    """Lightweight file reference used for memoization without content fingerprinting."""
+
+    rel_path: str
+    abs_path: str
+    size: int
+    mtime_ns: int
+
+
+async def _indexable_file_from_local(file: localfs.File) -> IndexableFile | None:
+    """Build a stat-based file reference without reading file content."""
+    path = file.file_path.resolve()
+    try:
+        stat = await asyncio.to_thread(os.stat, path)
+    except OSError:
+        return None
+    return IndexableFile(
+        rel_path=file.file_path.path.as_posix(),
+        abs_path=str(path),
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+    )
+
+
+def _decode_file_bytes(data: bytes, encoding: str | None = None, errors: str = "replace") -> str:
+    """Decode file bytes like FileLike.read_text without caching full content."""
+    if encoding is not None:
+        return data.decode(encoding, errors)
+    for bom, enc in _BOM_ENCODINGS:
+        if data.startswith(bom):
+            return data.decode(enc, errors)
+    return data.decode("utf-8", errors)
+
+
+def _read_path_bytes(path: Path, size: int) -> bytes:
+    with path.open("rb") as f:
+        return f.read(size)
+
+
+async def _read_file_text_bounded(file: IndexableFile) -> str | None:
+    """Read file text with a hard byte cap; return None if too large or unavailable."""
+    max_bytes = _max_file_read_bytes()
+    if file.size > max_bytes:
+        return None
+
+    path = Path(file.abs_path)
+    try:
+        data = await asyncio.to_thread(_read_path_bytes, path, max_bytes + 1)
+    except OSError:
+        return None
+    if len(data) > max_bytes:
+        return None
+    return _decode_file_bytes(data)
 
 
 def _normalize_gitignore_lines(lines: Iterable[str], directory: PurePath) -> list[str]:
@@ -307,7 +381,7 @@ async def _declare_chunk_batch(
 
 @coco.fn(memo=True)
 async def process_file(
-    file: localfs.File,
+    file: IndexableFile,
     table: sqlite.TableTarget[CodeChunk],
 ) -> None:
     """Process a single file: chunk, embed, and store."""
@@ -315,38 +389,40 @@ async def process_file(
     indexing_params = coco.use_context(INDEXING_EMBED_PARAMS)
 
     try:
-        content = await file.read_text()
+        content = await _read_file_text_bounded(file)
     except UnicodeDecodeError:
+        return
+    if content is None:
         return
 
     if not content.strip():
         return
 
-    suffix = file.file_path.path.suffix
+    rel_path = Path(file.rel_path)
+    suffix = rel_path.suffix
     project_root = coco.use_context(CODEBASE_DIR)
     ps = load_project_settings(project_root)
     ext_lang_map = {f".{lo.ext}": lo.lang for lo in ps.language_overrides}
     language = (
         ext_lang_map.get(suffix)
-        or detect_code_language(filename=file.file_path.path.name)
+        or detect_code_language(filename=rel_path.name)
         or "text"
     )
 
     chunker_registry = coco.use_context(CHUNKER_REGISTRY)
     chunker = chunker_registry.get(suffix)
     language, chunks = _split_file_content(
-        Path(file.file_path.path),
+        rel_path,
         content,
         language=language,
         chunker=chunker,
     )
 
     id_gen = IdGenerator()
-    file_path = file.file_path.path.as_posix()
     for chunk_batch in _iter_chunk_batches(chunks, _chunk_embed_batch_size()):
         await _declare_chunk_batch(
             chunks=chunk_batch,
-            file_path=file_path,
+            file_path=file.rel_path,
             language=language,
             id_gen=id_gen,
             embedder=embedder,
@@ -389,4 +465,7 @@ async def indexer_main() -> None:
 
     with coco.component_subpath(coco.Symbol("process_file")):
         async for key, file in files.items():
-            await coco.use_mount(coco.component_subpath(key), process_file, file, table)
+            file_ref = await _indexable_file_from_local(file)
+            if file_ref is None:
+                continue
+            await coco.use_mount(coco.component_subpath(key), process_file, file_ref, table)

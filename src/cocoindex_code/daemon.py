@@ -70,6 +70,20 @@ from .shared import Embedder, check_embedding, create_embedder
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_LOADED_PROJECTS = 16
+MAX_LOADED_PROJECTS_ENV = "COCOINDEX_CODE_MAX_LOADED_PROJECTS"
+
+
+def _max_loaded_projects() -> int:
+    raw = os.environ.get(MAX_LOADED_PROJECTS_ENV)
+    if raw is None:
+        return DEFAULT_MAX_LOADED_PROJECTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_LOADED_PROJECTS
+    return max(1, value)
+
 
 def _build_backward_compat_warning(
     user_settings: UserSettings,
@@ -148,39 +162,72 @@ class ProjectRegistry:
             raise RuntimeError(
                 "Daemon has no global settings loaded. Run `ccc init` to set up cocoindex-code."
             )
-        if project_root not in self._projects:
-            root = Path(project_root)
-            project_settings = load_project_settings(root)
-            chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
-            project = await Project.create(
-                root,
-                self._embedder,
-                indexing_params=self.indexing_params,
-                query_params=self.query_params,
-                chunker_registry=chunker_registry,
-            )
+        if project_root in self._projects:
+            project = self._projects.pop(project_root)
             self._projects[project_root] = project
-        return self._projects[project_root]
+            return project
 
-    def remove_project(self, project_root: str) -> bool:
+        root = Path(project_root)
+        project_settings = load_project_settings(root)
+        chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
+        project = await Project.create(
+            root,
+            self._embedder,
+            indexing_params=self.indexing_params,
+            query_params=self.query_params,
+            chunker_registry=chunker_registry,
+        )
+        self._projects[project_root] = project
+        await self._evict_idle_projects(protected_root=project_root)
+        return project
+
+    async def _evict_idle_projects(self, protected_root: str) -> None:
+        """Close least-recently-used idle projects when the registry grows too large."""
+        import gc
+
+        evicted = False
+        while len(self._projects) > _max_loaded_projects():
+            victim_root: str | None = None
+            for root, project in self._projects.items():
+                if root == protected_root or project.is_indexing:
+                    continue
+                victim_root = root
+                break
+
+            if victim_root is None:
+                break
+
+            project = self._projects.pop(victim_root)
+            await project.aclose()
+            del project
+            evicted = True
+
+        if evicted:
+            gc.collect()
+
+    async def remove_project(self, project_root: str) -> bool:
         """Remove a project from the registry. Returns True if it was loaded."""
         import gc
 
         project = self._projects.pop(project_root, None)
         if project is not None:
-            project.close()
+            await project.aclose()
             del project
             gc.collect()
             return True
         return False
 
-    def close_all(self) -> None:
+    async def close_all(self) -> None:
         """Close all loaded projects and release resources."""
         import gc
 
-        for project in self._projects.values():
-            project.close()
+        projects = list(self._projects.values())
         self._projects.clear()
+        for project in projects:
+            try:
+                await project.aclose()
+            except Exception:
+                logger.exception("Error closing project")
         gc.collect()
 
     def list_projects(self) -> list[DaemonProjectInfo]:
@@ -188,7 +235,7 @@ class ProjectRegistry:
         return [
             DaemonProjectInfo(
                 project_root=root,
-                indexing=project._index_lock.locked(),
+                indexing=project.is_indexing,
             )
             for root, project in self._projects.items()
         ]
@@ -511,7 +558,7 @@ async def _dispatch(
             )
 
         if isinstance(req, RemoveProjectRequest):
-            registry.remove_project(req.project_root)
+            await registry.remove_project(req.project_root)
             return RemoveProjectResponse(ok=True)
 
         if isinstance(req, StopRequest):
@@ -680,7 +727,7 @@ def run_daemon() -> None:
             loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
 
         # 3. Release project resources.
-        registry.close_all()
+        loop.run_until_complete(registry.close_all())
         loop.close()
 
         # 4. Remove socket and PID file.

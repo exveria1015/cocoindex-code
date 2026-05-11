@@ -7,6 +7,7 @@ queries the resulting SQLite database to verify chunk content and language.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -14,14 +15,16 @@ from typing import Any
 import cocoindex as coco
 import numpy as np
 import pytest
+from cocoindex.connectors import localfs as coco_localfs
 from cocoindex.connectors import sqlite as coco_sqlite
 from cocoindex.resources.schema import VectorSchema
 from example_toml_chunker import toml_chunker
 
 import cocoindex_code.indexer as _indexer
 from cocoindex_code.chunking import CHUNKER_REGISTRY, Chunk, TextPosition
+from cocoindex_code.daemon import ProjectRegistry
 from cocoindex_code.project import Project
-from cocoindex_code.settings import ProjectSettings
+from cocoindex_code.settings import ProjectSettings, save_project_settings
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,8 +53,6 @@ async def _index_project(
     """Create a Project and run a full index pass."""
     settings = ProjectSettings(include_patterns=["**/*.*"], exclude_patterns=["**/.cocoindex_code"])
     stub = _StubEmbedder()
-    from cocoindex_code.settings import save_project_settings
-
     save_project_settings(project_root, settings)
     project = await Project.create(
         project_root,
@@ -216,3 +217,89 @@ async def test_large_files_use_streaming_chunker_fallback(
     assert len(chunks) > 1
     assert all(c["language"] == "python" for c in chunks)
     assert any("func_0" in c["content"] for c in chunks)
+
+
+async def test_file_reads_are_bounded_and_do_not_use_read_text_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Indexing should skip oversized files and avoid FileLike full-read caching."""
+
+    async def _fail_read_text(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("read_text should not be used")
+
+    original_read_impl = coco_localfs.File._read_impl
+
+    async def _bounded_read_impl(self: coco_localfs.File, size: int = -1) -> bytes:
+        assert 0 <= size <= 65, f"unexpected unbounded read size: {size}"
+        return await original_read_impl(self, size)
+
+    monkeypatch.setenv(_indexer.MAX_FILE_READ_BYTES_ENV, "64")
+    monkeypatch.setattr(coco_localfs.File, "read_text", _fail_read_text)
+    monkeypatch.setattr(coco_localfs.File, "_read_impl", _bounded_read_impl)
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "small.py").write_text("def small():\n    return 1\n")
+    (tmp_path / "large.py").write_text("def large():\n" + ("#" * 256) + "\n")
+
+    await _index_project(tmp_path)
+    chunks = _query_chunks(tmp_path)
+
+    assert any("small" in c["content"] for c in chunks)
+    assert not any("large" in c["content"] for c in chunks)
+
+
+async def test_project_aclose_cancels_background_index_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing a project should not leave load-time indexing tasks alive."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "sample.py").write_text("def foo():\n    return 1\n")
+    project = await _index_project(tmp_path)
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def _never_finish(
+        on_progress: Any | None = None,
+    ) -> None:
+        started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    project._initial_index_done.clear()
+    monkeypatch.setattr(project, "_run_index_inner", _never_finish)
+
+    await project.ensure_indexing_started()
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert project._index_tasks
+
+    await project.aclose()
+
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    assert not project._index_tasks
+
+
+async def test_project_registry_evicts_idle_projects_over_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon registry should not retain an unbounded set of idle projects."""
+    monkeypatch.setenv("COCOINDEX_CODE_MAX_LOADED_PROJECTS", "1")
+    project_roots = [tmp_path / "one", tmp_path / "two"]
+    for root in project_roots:
+        root.mkdir()
+        save_project_settings(root, ProjectSettings(include_patterns=["**/*.py"]))
+
+    registry = ProjectRegistry(_StubEmbedder())
+    first = await registry.get_project(str(project_roots[0]))
+    second = await registry.get_project(str(project_roots[1]))
+
+    listed = registry.list_projects()
+    assert [p.project_root for p in listed] == [str(project_roots[1])]
+    assert first._closed
+    assert not second._closed
+
+    await registry.close_all()

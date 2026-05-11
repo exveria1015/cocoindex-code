@@ -693,6 +693,17 @@ COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/db-files,/workspace2=/db-files2
 
 Both source and target must be absolute paths. If no mapping matches, the default location is used.
 
+### Indexing Memory Controls
+
+The indexer avoids unbounded work by limiting large-file reads, syntax-aware splitting, concurrent chunk embedding, and loaded idle projects. The defaults are conservative for normal source trees; raise them only when you intentionally want to index very large generated files or keep many project databases open in one daemon.
+
+| Environment variable | Default | Purpose |
+|----------------------|---------|---------|
+| `COCOINDEX_CODE_MAX_FILE_READ_BYTES` | `5000000` | Skip source files larger than this many bytes before reading content. |
+| `COCOINDEX_CODE_MAX_RECURSIVE_SPLIT_BYTES` | `1000000` | Use the streaming fallback splitter instead of `RecursiveSplitter` above this size. |
+| `COCOINDEX_CODE_CHUNK_EMBED_BATCH_SIZE` | `64` | Maximum chunk embedding requests scheduled together for one file. |
+| `COCOINDEX_CODE_MAX_LOADED_PROJECTS` | `16` | Maximum idle projects retained by the daemon before LRU eviction. Active indexing projects are not evicted. |
+
 ## Troubleshooting
 
 Run `ccc doctor` to diagnose common issues. It checks your settings, daemon health, embedding model, file matching, and index status — all in one command.
