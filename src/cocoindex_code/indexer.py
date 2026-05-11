@@ -385,7 +385,7 @@ def _embedding_text_for_chunk(*, file_path: str, language: str, chunk: Chunk) ->
     symbols = _symbol_names_for_chunk(chunk.text)
     if symbols:
         metadata.append(f"symbols: {', '.join(symbols)}")
-    return "\n".join([*metadata, "code:", chunk.text])
+    return "\n".join(["code:", chunk.text, "", "metadata:", *metadata])
 
 
 async def _declare_chunk_batch(
@@ -429,7 +429,7 @@ async def _declare_chunk_batch(
         )
 
 
-@coco.fn(memo=True, version=2)
+@coco.fn(memo=True, version=3)
 async def process_file(
     file: IndexableFile,
     table: sqlite.TableTarget[CodeChunk],

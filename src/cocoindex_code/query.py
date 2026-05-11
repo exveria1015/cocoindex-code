@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,66 @@ _HYBRID_FETCH_MIN = 50
 _HYBRID_FETCH_MAX = 200
 _RRF_K = 60.0
 _SEMANTIC_WEIGHT = 1.0
-_LEXICAL_WEIGHT = 1.0
+_LEXICAL_WEIGHT = 0.55
+_COMMON_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "use",
+    "used",
+    "uses",
+    "using",
+    "when",
+    "where",
+    "with",
+}
+_METADATA_LABEL_STOPWORDS = {
+    "code",
+    "file",
+    "files",
+    "language",
+    "languages",
+    "line",
+    "lines",
+    "path",
+    "paths",
+    "symbol",
+    "symbols",
+}
+_TOKEN_SYNONYMS = {
+    "environment": ("env",),
+    "environments": ("envs",),
+    "parameter": ("param",),
+    "parameters": ("params",),
+    "variable": ("var",),
+    "variables": ("vars",),
+}
+
+
+@dataclass(frozen=True)
+class _LexicalTerm:
+    value: str
+    content_weight: float
+    path_weight: float
+    language_weight: float = 0.0
 
 
 def _l2_to_score(distance: float) -> float:
@@ -108,21 +168,92 @@ def _full_scan_query(
     ).fetchall()
 
 
-def _query_tokens(query: str) -> list[str]:
-    """Tokenize query for lexical retrieval, including identifier subwords."""
-    tokens: list[str] = []
-    seen: set[str] = set()
-    raw_parts = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+", query)
+def _is_identifier_like(part: str) -> bool:
+    """Return whether a query part looks like a symbol, env var, or path."""
+    return (
+        "_" in part
+        or "/" in part
+        or "." in part
+        or "$" in part
+        or any(c.isdigit() for c in part)
+        or part.isupper()
+        or bool(re.search(r"[a-z][A-Z]|[A-Z][a-z]+[A-Z]", part))
+    )
+
+
+def _identifier_subtokens(part: str) -> list[str]:
+    """Split code identifiers and paths into searchable sub-tokens."""
+    subtokens: list[str] = []
+    for segment in re.split(r"[_./$:-]+", part):
+        subtokens.extend(re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", segment))
+    return [token.lower() for token in subtokens]
+
+
+def _add_lexical_term(terms: dict[str, _LexicalTerm], term: _LexicalTerm) -> None:
+    existing = terms.get(term.value)
+    if existing is None:
+        terms[term.value] = term
+        return
+    terms[term.value] = _LexicalTerm(
+        value=term.value,
+        content_weight=max(existing.content_weight, term.content_weight),
+        path_weight=max(existing.path_weight, term.path_weight),
+        language_weight=max(existing.language_weight, term.language_weight),
+    )
+
+
+def _query_terms(query: str) -> list[_LexicalTerm]:
+    """Tokenize query into weighted lexical terms."""
+    raw_parts = re.findall(r"[A-Za-z_][A-Za-z0-9_$./-]*|\d+", query)
+    has_identifier = any(_is_identifier_like(part) for part in raw_parts)
+    stopwords = set(_COMMON_STOPWORDS)
+    if has_identifier:
+        stopwords.update(_METADATA_LABEL_STOPWORDS)
+
+    terms: dict[str, _LexicalTerm] = {}
     for part in raw_parts:
-        pieces = [part]
-        pieces.extend(re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", part.replace("_", " ")))
-        for piece in pieces:
-            token = piece.lower()
-            if len(token) < 2 or token in seen:
-                continue
-            seen.add(token)
-            tokens.append(token)
-    return tokens[:12]
+        value = part.strip("._-/").lower()
+        if len(value) < 2 or value in stopwords:
+            continue
+
+        identifier_like = _is_identifier_like(part)
+        if identifier_like:
+            _add_lexical_term(
+                terms,
+                _LexicalTerm(value=value, content_weight=8.0, path_weight=10.0),
+            )
+        elif len(value) >= 4:
+            _add_lexical_term(
+                terms,
+                _LexicalTerm(value=value, content_weight=0.35, path_weight=0.6),
+            )
+
+        for synonym in _TOKEN_SYNONYMS.get(value, ()):
+            _add_lexical_term(
+                terms,
+                _LexicalTerm(value=synonym, content_weight=0.35, path_weight=0.4),
+            )
+
+        if identifier_like:
+            for subtoken in _identifier_subtokens(part):
+                if len(subtoken) < 3 or subtoken in stopwords:
+                    continue
+                _add_lexical_term(
+                    terms,
+                    _LexicalTerm(
+                        value=subtoken,
+                        content_weight=0.45,
+                        path_weight=0.7,
+                        language_weight=0.35,
+                    ),
+                )
+
+    return list(terms.values())[:16]
+
+
+def _like_pattern(term: str) -> str:
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def _lexical_query(
@@ -133,8 +264,8 @@ def _lexical_query(
     paths: list[str] | None = None,
 ) -> list[tuple[Any, ...]]:
     """Fetch lexical candidates with lightweight identifier/path scoring."""
-    tokens = _query_tokens(query)
-    if not tokens:
+    terms = _query_terms(query)
+    if not terms:
         return []
 
     filter_params: list[Any] = []
@@ -144,18 +275,29 @@ def _lexical_query(
     match_params: list[Any] = []
     score_terms: list[str] = []
     score_params: list[Any] = []
-    for token in tokens:
-        like = f"%{token}%"
-        match_clauses.append("(lower(content) LIKE ? OR lower(file_path) LIKE ?)")
+    for term in terms:
+        like = _like_pattern(term.value)
+        match_clauses.append(
+            "(lower(content) LIKE ? ESCAPE '\\' OR lower(file_path) LIKE ? ESCAPE '\\')"
+        )
         match_params.extend([like, like])
         score_terms.extend(
             [
-                "CASE WHEN lower(file_path) LIKE ? THEN 4.0 ELSE 0.0 END",
-                "CASE WHEN lower(content) LIKE ? THEN 1.0 ELSE 0.0 END",
-                "CASE WHEN lower(language) = ? THEN 0.5 ELSE 0.0 END",
+                "CASE WHEN lower(file_path) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
+                "CASE WHEN lower(content) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
+                "CASE WHEN lower(language) = ? THEN ? ELSE 0.0 END",
             ]
         )
-        score_params.extend([like, like, token])
+        score_params.extend(
+            [
+                like,
+                term.path_weight,
+                like,
+                term.content_weight,
+                term.value,
+                term.language_weight,
+            ]
+        )
 
     conditions.append(f"({' OR '.join(match_clauses)})")
     where = f"WHERE {' AND '.join(conditions)}"
@@ -226,7 +368,7 @@ def _fuse_results(
                 "score": 0.0,
             },
         )
-        lexical_weight = min(2.0, max(0.5, float(lexical_score)))
+        lexical_weight = min(1.8, max(0.0, float(lexical_score) / 4.0))
         entry["score"] += (_LEXICAL_WEIGHT * lexical_weight) / (_RRF_K + rank)
 
     ranked = sorted(

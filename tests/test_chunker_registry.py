@@ -283,6 +283,7 @@ async def test_embedding_text_includes_metadata_but_stores_raw_content(tmp_path:
         or "symbols: SearchService, find_user" in indexed_text
     )
     assert "code:\nclass SearchService" in indexed_text
+    assert indexed_text.index("code:\nclass SearchService") < indexed_text.index("metadata:")
 
 
 async def test_hybrid_search_uses_lexical_identifier_matches(tmp_path: Path) -> None:
@@ -297,6 +298,56 @@ async def test_hybrid_search_uses_lexical_identifier_matches(tmp_path: Path) -> 
     assert results
     assert results[0].file_path == "needle.py"
     assert "specialIdentifier" in results[0].content
+
+
+async def test_hybrid_search_prioritizes_exact_identifier_over_metadata_words(
+    tmp_path: Path,
+) -> None:
+    """Metadata label words should not outrank an exact symbol match."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "indexer.py").write_text(
+        "def _embedding_text_for_chunk():\n    return 'metadata'\n"
+    )
+    (tmp_path / "tests" / "test_indexer.py").write_text(
+        "def test_metadata_labels():\n"
+        "    assert 'path: src/search.py'\n"
+        "    assert 'language: python'\n"
+        "    assert 'symbols: SearchService'\n"
+    )
+
+    project = await _index_project(tmp_path)
+    results = await project.search("_embedding_text_for_chunk path language symbols", limit=3)
+
+    assert results
+    assert results[0].file_path == "src/indexer.py"
+
+
+async def test_hybrid_search_uses_identifier_subtokens_without_generic_drift(
+    tmp_path: Path,
+) -> None:
+    """Identifier-like prose should beat generic settings/env matches."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "settings.py").write_text(
+        "def save_environment_settings_variables():\n"
+        "    return 'settings environment variables settings'\n"
+    )
+    (tmp_path / "tests" / "test_backward_compat.py").write_text(
+        "def test_legacy_entry_creates_settings_from_env_vars():\n"
+        "    assert True\n"
+    )
+
+    project = await _index_project(tmp_path)
+    results = await project.search(
+        "legacy entry creates settings from environment variables",
+        limit=3,
+    )
+
+    assert results
+    assert results[0].file_path == "tests/test_backward_compat.py"
 
 
 async def test_project_aclose_cancels_background_index_task(
