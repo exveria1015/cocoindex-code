@@ -142,4 +142,8 @@ class CodeChunk:
     content: str
     start_line: int
     end_line: int
+    symbols: str
+    enclosing_symbols: str
+    file_role: str
+    basename: str
     embedding: Annotated[npt.NDArray[np.float32], EMBEDDER]

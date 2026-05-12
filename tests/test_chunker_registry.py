@@ -277,10 +277,16 @@ async def test_embedding_text_includes_metadata_but_stores_raw_content(tmp_path:
     assert all("path: src/search.py" not in c["content"] for c in chunks)
     indexed_text = "\n".join(embedder.texts)
     assert "path: src/search.py" in indexed_text
+    assert "basename: search.py" in indexed_text
+    assert "role: implementation" in indexed_text
     assert "language: python" in indexed_text
     assert (
         "symbols: find_user, SearchService" in indexed_text
         or "symbols: SearchService, find_user" in indexed_text
+    )
+    assert (
+        "context: SearchService, SearchService.find_user" in indexed_text
+        or "context: SearchService.find_user, SearchService" in indexed_text
     )
     assert "code:\nclass SearchService" in indexed_text
     assert indexed_text.index("code:\nclass SearchService") < indexed_text.index("metadata:")
@@ -348,6 +354,48 @@ async def test_hybrid_search_uses_identifier_subtokens_without_generic_drift(
 
     assert results
     assert results[0].file_path == "tests/test_backward_compat.py"
+
+
+async def test_hybrid_search_prefers_enclosing_implementation_over_docs_and_tests(
+    tmp_path: Path,
+) -> None:
+    """Implementation-intent queries should use symbol context to beat docs/tests."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "src" / "adapters").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "README.md").write_text(
+        "Adapter notes: request options plugins plugin_selection "
+        "concurrent_plugin_calls are supported.\n"
+    )
+    (tmp_path / "tests" / "test_native_adapter.py").write_text(
+        "def test_options_are_forwarded():\n"
+        "    assert options['plugins'] == request.plugins\n"
+        "    assert options['plugin_selection'] == 'required'\n"
+        "    assert options['concurrent_plugin_calls'] is True\n"
+    )
+    (tmp_path / "src" / "adapters" / "native.py").write_text(
+        "class NativeAdapter:\n"
+        "    def build_request_options(self, request, stream):\n"
+        "        options = {'stream': stream}\n"
+        "        if request.plugins:\n"
+        "            options['plugins'] = request.plugins\n"
+        "        if request.plugin_selection is not None:\n"
+        "            options['plugin_selection'] = request.plugin_selection\n"
+        "        if request.concurrent_plugin_calls:\n"
+        "            options['concurrent_plugin_calls'] = request.concurrent_plugin_calls\n"
+        "        return options\n"
+    )
+
+    project = await _index_project(tmp_path)
+    results = await project.search(
+        "where are adapter request options constructed for plugins "
+        "plugin_selection concurrent_plugin_calls",
+        limit=5,
+    )
+
+    assert results
+    assert results[0].file_path == "src/adapters/native.py"
+    assert "build_request_options" in results[0].content
 
 
 async def test_project_aclose_cancels_background_index_task(

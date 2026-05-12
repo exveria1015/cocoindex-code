@@ -1,0 +1,39 @@
+name: example-code-navigation
+description: Example fixed-query set for checking implementation-oriented retrieval.
+queries:
+  - id: Q1
+    query: where does bearer token authentication reject unauthorized requests
+    expected_file: sample_project/src/auth.py
+    expected_rank_max: 1
+  - id: Q2
+    query: how are plugin directories discovered and registered
+    expected_file: sample_project/src/catalog.py
+    expected_rank_max: 1
+  - id: Q3
+    query: normalize incoming event payloads into internal messages
+    expected_file: sample_project/src/prompting.py
+    expected_rank_max: 1
+  - id: Q4
+    query: stream progress updates with status and visible text deltas
+    expected_file: sample_project/src/app.py
+    expected_rank_max: 3
+  - id: Q5
+    query: apply adapter template with plugins and fallback to flattened plugin definitions
+    expected_file: sample_project/src/adapters/native.py
+    expected_rank_max: 2
+  - id: Q6
+    query: infer request budget from configuration and scaling factor
+    expected_file: sample_project/src/limits.py
+    expected_rank_max: 1
+  - id: Q7
+    query: where are adapter request options constructed for plugins plugin_selection concurrent_plugin_calls
+    expected_file: sample_project/src/adapters/native.py
+    expected_rank_max: 3
+    exact_terms:
+      - plugins
+      - plugin_selection
+      - concurrent_plugin_calls
+  - id: Q8
+    query: merge streaming plugin call deltas into final plugin calls
+    expected_file: sample_project/src/message_types.py
+    expected_rank_max: 2

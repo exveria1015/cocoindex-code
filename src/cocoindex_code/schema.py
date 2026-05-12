@@ -14,6 +14,10 @@ class CodeChunk:
     content: str
     start_line: int
     end_line: int
+    symbols: str
+    enclosing_symbols: str
+    file_role: str
+    basename: str
     embedding: Any  # NDArray - type hint relaxed for compatibility
 
 

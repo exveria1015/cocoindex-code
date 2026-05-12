@@ -61,13 +61,47 @@ _METADATA_LABEL_STOPWORDS = {
     "symbols",
 }
 _TOKEN_SYNONYMS = {
+    "cpp": ("gguf", "llama_cpp"),
     "environment": ("env",),
     "environments": ("envs",),
+    "kwargs": ("request_kwargs",),
+    "llama": ("gguf", "llama_cpp"),
     "parameter": ("param",),
     "parameters": ("params",),
     "variable": ("var",),
     "variables": ("vars",),
 }
+
+_IMPLEMENTATION_INTENT_TERMS = {
+    "apply",
+    "build",
+    "completion",
+    "completions",
+    "construct",
+    "constructed",
+    "defined",
+    "directories",
+    "discover",
+    "discovered",
+    "does",
+    "fallback",
+    "handle",
+    "handled",
+    "handles",
+    "how",
+    "implementation",
+    "implemented",
+    "infer",
+    "logic",
+    "merge",
+    "normalize",
+    "reject",
+    "stream",
+    "streams",
+    "where",
+}
+_TEST_INTENT_TERMS = {"assert", "fixture", "pytest", "regression", "test", "tests"}
+_DOC_INTENT_TERMS = {"docs", "documentation", "readme"}
 
 
 @dataclass(frozen=True)
@@ -75,6 +109,9 @@ class _LexicalTerm:
     value: str
     content_weight: float
     path_weight: float
+    symbol_weight: float = 0.0
+    enclosing_weight: float = 0.0
+    basename_weight: float = 0.0
     language_weight: float = 0.0
 
 
@@ -124,7 +161,8 @@ def _knn_query(
     if language is not None:
         return conn.execute(
             """
-            SELECT id, file_path, language, content, start_line, end_line, distance
+            SELECT id, file_path, language, content, start_line, end_line,
+                   symbols, enclosing_symbols, file_role, basename, distance
             FROM code_chunks_vec
             WHERE embedding MATCH ? AND k = ? AND language = ?
             ORDER BY distance
@@ -133,7 +171,8 @@ def _knn_query(
         ).fetchall()
     return conn.execute(
         """
-        SELECT id, file_path, language, content, start_line, end_line, distance
+        SELECT id, file_path, language, content, start_line, end_line,
+               symbols, enclosing_symbols, file_role, basename, distance
         FROM code_chunks_vec
         WHERE embedding MATCH ? AND k = ?
         ORDER BY distance
@@ -158,6 +197,7 @@ def _full_scan_query(
     return conn.execute(
         f"""
         SELECT id, file_path, language, content, start_line, end_line,
+               symbols, enclosing_symbols, file_role, basename,
                vec_distance_L2(embedding, ?) as distance
         FROM code_chunks_vec
         {where}
@@ -198,6 +238,9 @@ def _add_lexical_term(terms: dict[str, _LexicalTerm], term: _LexicalTerm) -> Non
         value=term.value,
         content_weight=max(existing.content_weight, term.content_weight),
         path_weight=max(existing.path_weight, term.path_weight),
+        symbol_weight=max(existing.symbol_weight, term.symbol_weight),
+        enclosing_weight=max(existing.enclosing_weight, term.enclosing_weight),
+        basename_weight=max(existing.basename_weight, term.basename_weight),
         language_weight=max(existing.language_weight, term.language_weight),
     )
 
@@ -220,18 +263,39 @@ def _query_terms(query: str) -> list[_LexicalTerm]:
         if identifier_like:
             _add_lexical_term(
                 terms,
-                _LexicalTerm(value=value, content_weight=8.0, path_weight=10.0),
+                _LexicalTerm(
+                    value=value,
+                    content_weight=8.0,
+                    path_weight=10.0,
+                    symbol_weight=14.0,
+                    enclosing_weight=16.0,
+                    basename_weight=12.0,
+                ),
             )
         elif len(value) >= 4:
             _add_lexical_term(
                 terms,
-                _LexicalTerm(value=value, content_weight=0.35, path_weight=0.6),
+                _LexicalTerm(
+                    value=value,
+                    content_weight=0.35,
+                    path_weight=0.6,
+                    symbol_weight=0.8,
+                    enclosing_weight=0.8,
+                    basename_weight=0.7,
+                ),
             )
 
         for synonym in _TOKEN_SYNONYMS.get(value, ()):
             _add_lexical_term(
                 terms,
-                _LexicalTerm(value=synonym, content_weight=0.35, path_weight=0.4),
+                _LexicalTerm(
+                    value=synonym,
+                    content_weight=0.35,
+                    path_weight=0.8,
+                    symbol_weight=1.2,
+                    enclosing_weight=1.4,
+                    basename_weight=1.0,
+                ),
             )
 
         if identifier_like:
@@ -244,6 +308,9 @@ def _query_terms(query: str) -> list[_LexicalTerm]:
                         value=subtoken,
                         content_weight=0.45,
                         path_weight=0.7,
+                        symbol_weight=1.4,
+                        enclosing_weight=1.8,
+                        basename_weight=1.0,
                         language_weight=0.35,
                     ),
                 )
@@ -278,13 +345,22 @@ def _lexical_query(
     for term in terms:
         like = _like_pattern(term.value)
         match_clauses.append(
-            "(lower(content) LIKE ? ESCAPE '\\' OR lower(file_path) LIKE ? ESCAPE '\\')"
+            "("
+            "lower(content) LIKE ? ESCAPE '\\' OR "
+            "lower(file_path) LIKE ? ESCAPE '\\' OR "
+            "lower(symbols) LIKE ? ESCAPE '\\' OR "
+            "lower(enclosing_symbols) LIKE ? ESCAPE '\\' OR "
+            "lower(basename) LIKE ? ESCAPE '\\'"
+            ")"
         )
-        match_params.extend([like, like])
+        match_params.extend([like, like, like, like, like])
         score_terms.extend(
             [
                 "CASE WHEN lower(file_path) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
                 "CASE WHEN lower(content) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
+                "CASE WHEN lower(symbols) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
+                "CASE WHEN lower(enclosing_symbols) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
+                "CASE WHEN lower(basename) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
                 "CASE WHEN lower(language) = ? THEN ? ELSE 0.0 END",
             ]
         )
@@ -294,6 +370,12 @@ def _lexical_query(
                 term.path_weight,
                 like,
                 term.content_weight,
+                like,
+                term.symbol_weight,
+                like,
+                term.enclosing_weight,
+                like,
+                term.basename_weight,
                 term.value,
                 term.language_weight,
             ]
@@ -306,6 +388,7 @@ def _lexical_query(
     return conn.execute(
         f"""
         SELECT id, file_path, language, content, start_line, end_line,
+               symbols, enclosing_symbols, file_role, basename,
                ({score_expr}) as lexical_score
         FROM code_chunks_vec
         {where}
@@ -335,24 +418,131 @@ def _semantic_candidates(
             for lang in languages
             for row in _knn_query(conn, embedding_bytes, fetch_k, lang)
         ),
-        key=lambda r: r[6],
+        key=lambda r: r[10],
     )
+
+
+def _query_word_set(query: str) -> set[str]:
+    return {part.lower() for part in re.findall(r"[A-Za-z_][A-Za-z0-9_$./-]*|\d+", query)}
+
+
+def _metadata_text(*values: str) -> str:
+    return " ".join(values).lower()
+
+
+def _has_implementation_intent(words: set[str]) -> bool:
+    return bool(words & _IMPLEMENTATION_INTENT_TERMS)
+
+
+def _has_test_intent(words: set[str]) -> bool:
+    return bool(words & _TEST_INTENT_TERMS)
+
+
+def _has_doc_intent(words: set[str]) -> bool:
+    return bool(words & _DOC_INTENT_TERMS)
+
+
+def _rerank_bonus(
+    *,
+    query: str,
+    file_path: str,
+    content: str,
+    symbols: str,
+    enclosing_symbols: str,
+    file_role: str,
+    basename: str,
+) -> float:
+    """Small metadata-aware adjustment after RRF fusion.
+
+    This deliberately stays lightweight: semantic/vector rank and lexical rank
+    still do the heavy lifting, while file role and symbol context resolve
+    close calls between implementation chunks, tests, and documentation.
+    """
+    words = _query_word_set(query)
+    query_terms = _query_terms(query)
+    content_lower = content.lower()
+    metadata = _metadata_text(file_path, symbols, enclosing_symbols, basename)
+
+    bonus = 0.0
+    identifier_hits = 0
+    for term in query_terms:
+        value = term.value.lower()
+        if not value:
+            continue
+        if term.content_weight >= 8.0 and (value in content_lower or value in metadata):
+            identifier_hits += 1
+        if value in enclosing_symbols.lower():
+            bonus += 0.012
+        elif value in symbols.lower():
+            bonus += 0.008
+        elif value in basename.lower():
+            bonus += 0.008
+        elif value in file_path.lower():
+            bonus += 0.006
+        elif value in metadata:
+            bonus += 0.002
+
+    bonus += min(0.030, identifier_hits * 0.006)
+    if ({"llama", "cpp"} & words) and "gguf" in file_path.lower():
+        bonus += 0.060
+
+    implementation_intent = _has_implementation_intent(words)
+    test_intent = _has_test_intent(words)
+    doc_intent = _has_doc_intent(words)
+    if implementation_intent and not test_intent and not doc_intent:
+        if file_role == "implementation":
+            bonus += 0.035
+        elif file_role == "test":
+            bonus -= 0.035
+        elif file_role == "docs":
+            bonus -= 0.030
+        elif file_role == "config":
+            bonus -= 0.010
+    elif test_intent and file_role == "test":
+        bonus += 0.010
+    elif doc_intent and file_role == "docs":
+        bonus += 0.010
+
+    return bonus
 
 
 def _fuse_results(
     semantic_rows: list[tuple[Any, ...]],
     lexical_rows: list[tuple[Any, ...]],
+    query: str,
     limit: int,
     offset: int,
 ) -> list[QueryResult]:
     combined: dict[int, dict[str, Any]] = {}
 
     for rank, row in enumerate(semantic_rows, start=1):
-        chunk_id, file_path, language, content, start_line, end_line, distance = row
+        (
+            chunk_id,
+            file_path,
+            language,
+            content,
+            start_line,
+            end_line,
+            symbols,
+            enclosing_symbols,
+            file_role,
+            basename,
+            distance,
+        ) = row
         entry = combined.setdefault(
             chunk_id,
             {
-                "row": (file_path, language, content, start_line, end_line),
+                "row": (
+                    file_path,
+                    language,
+                    content,
+                    start_line,
+                    end_line,
+                    symbols,
+                    enclosing_symbols,
+                    file_role,
+                    basename,
+                ),
                 "score": 0.0,
             },
         )
@@ -360,16 +550,60 @@ def _fuse_results(
         entry["semantic_score"] = _l2_to_score(distance)
 
     for rank, row in enumerate(lexical_rows, start=1):
-        chunk_id, file_path, language, content, start_line, end_line, lexical_score = row
+        (
+            chunk_id,
+            file_path,
+            language,
+            content,
+            start_line,
+            end_line,
+            symbols,
+            enclosing_symbols,
+            file_role,
+            basename,
+            lexical_score,
+        ) = row
         entry = combined.setdefault(
             chunk_id,
             {
-                "row": (file_path, language, content, start_line, end_line),
+                "row": (
+                    file_path,
+                    language,
+                    content,
+                    start_line,
+                    end_line,
+                    symbols,
+                    enclosing_symbols,
+                    file_role,
+                    basename,
+                ),
                 "score": 0.0,
             },
         )
         lexical_weight = min(1.8, max(0.0, float(lexical_score) / 4.0))
         entry["score"] += (_LEXICAL_WEIGHT * lexical_weight) / (_RRF_K + rank)
+
+    for item in combined.values():
+        (
+            file_path,
+            _language,
+            _content,
+            _start_line,
+            _end_line,
+            symbols,
+            enclosing_symbols,
+            file_role,
+            basename,
+        ) = item["row"]
+        item["score"] += _rerank_bonus(
+            query=query,
+            file_path=file_path,
+            content=_content,
+            symbols=symbols,
+            enclosing_symbols=enclosing_symbols,
+            file_role=file_role,
+            basename=basename,
+        )
 
     ranked = sorted(
         combined.values(),
@@ -383,7 +617,7 @@ def _fuse_results(
     max_score = float(ranked[0]["score"]) if ranked else 1.0
     results: list[QueryResult] = []
     for item in page:
-        file_path, language, content, start_line, end_line = item["row"]
+        file_path, language, content, start_line, end_line, *_metadata = item["row"]
         results.append(
             QueryResult(
                 file_path=file_path,
@@ -431,4 +665,4 @@ async def query_codebase(
         semantic_rows = _semantic_candidates(conn, embedding_bytes, fetch_k, languages, paths)
         lexical_rows = _lexical_query(conn, query, fetch_k, languages, paths)
 
-    return _fuse_results(semantic_rows, lexical_rows, limit, offset)
+    return _fuse_results(semantic_rows, lexical_rows, query, limit, offset)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import bisect
 import codecs
@@ -10,7 +11,7 @@ import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, cast
 
 import cocoindex as coco
 from cocoindex.connectors import localfs, sqlite
@@ -109,6 +110,15 @@ class IndexableFile:
     abs_path: str
     size: int
     mtime_ns: int
+
+
+@dataclass(frozen=True)
+class _SymbolSpan:
+    """A symbol declaration span used to attach enclosing context to chunks."""
+
+    name: str
+    start_line: int
+    end_line: int
 
 
 async def _indexable_file_from_local(file: localfs.File) -> IndexableFile | None:
@@ -375,16 +385,140 @@ def _symbol_names_for_chunk(text: str) -> list[str]:
     return names
 
 
-def _embedding_text_for_chunk(*, file_path: str, language: str, chunk: Chunk) -> str:
+def _line_for_offset(line_starts: list[int], offset: int) -> int:
+    return bisect.bisect_right(line_starts, offset)
+
+
+def _python_symbol_spans(content: str) -> list[_SymbolSpan]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    spans: list[_SymbolSpan] = []
+
+    def visit(node: ast.AST, parents: tuple[str, ...]) -> None:
+        is_symbol = isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        next_parents = parents
+        if is_symbol:
+            symbol_node = cast(ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef, node)
+            name = ".".join((*parents, symbol_node.name))
+            end_line = getattr(symbol_node, "end_lineno", None) or symbol_node.lineno
+            spans.append(
+                _SymbolSpan(
+                    name=name,
+                    start_line=symbol_node.lineno,
+                    end_line=end_line,
+                )
+            )
+            next_parents = (*parents, symbol_node.name)
+
+        for child in ast.iter_child_nodes(node):
+            visit(child, next_parents)
+
+    visit(tree, ())
+    return spans
+
+
+def _regex_symbol_spans(content: str) -> list[_SymbolSpan]:
+    line_starts = _line_start_offsets(content)
+    found: list[tuple[str, int]] = []
+    seen_at_line: set[tuple[str, int]] = set()
+    for pattern in _SYMBOL_PATTERNS:
+        for match in pattern.finditer(content):
+            name = match.group(1)
+            line = _line_for_offset(line_starts, match.start())
+            key = (name, line)
+            if key in seen_at_line:
+                continue
+            seen_at_line.add(key)
+            found.append((name, line))
+
+    found.sort(key=lambda item: item[1])
+    spans: list[_SymbolSpan] = []
+    total_lines = max(1, content.count("\n") + 1)
+    for index, (name, line) in enumerate(found):
+        next_line = found[index + 1][1] if index + 1 < len(found) else total_lines + 1
+        spans.append(_SymbolSpan(name=name, start_line=line, end_line=max(line, next_line - 1)))
+    return spans
+
+
+def _symbol_spans_for_file(content: str, language: str) -> list[_SymbolSpan]:
+    if language == "python":
+        spans = _python_symbol_spans(content)
+        if spans:
+            return spans
+    return _regex_symbol_spans(content)
+
+
+def _enclosing_symbol_names(chunk: Chunk, spans: list[_SymbolSpan]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    chunk_start = chunk.start.line
+    chunk_end = chunk.end.line
+    for span in spans:
+        if span.end_line < chunk_start or span.start_line > chunk_end:
+            continue
+        if span.name in seen:
+            continue
+        seen.add(span.name)
+        names.append(span.name)
+    return names
+
+
+def _file_role(file_path: str) -> str:
+    """Classify a file so retrieval can distinguish docs/tests from implementation."""
+    path = PurePath(file_path)
+    parts = tuple(part.lower() for part in path.parts)
+    basename = path.name.lower()
+    suffix = path.suffix.lower()
+
+    if basename.startswith("test_") or basename.endswith("_test.py") or "tests" in parts:
+        return "test"
+    if basename in {"readme.md", "readme.mdx", "changelog.md", "license"} or suffix in {
+        ".md",
+        ".mdx",
+        ".rst",
+        ".txt",
+    }:
+        return "docs"
+    if basename in {
+        "pyproject.toml",
+        "package.json",
+        "tsconfig.json",
+        "dockerfile",
+        "docker-compose.yml",
+    } or suffix in {".toml", ".yaml", ".yml", ".json", ".ini", ".cfg"}:
+        return "config"
+    return "implementation"
+
+
+def _join_metadata(values: list[str]) -> str:
+    return ", ".join(values)
+
+
+def _embedding_text_for_chunk(
+    *,
+    file_path: str,
+    language: str,
+    chunk: Chunk,
+    symbols: list[str],
+    enclosing_symbols: list[str],
+    file_role: str,
+    basename: str,
+) -> str:
     """Build embedding input with code metadata while preserving raw stored content."""
     metadata = [
         f"path: {file_path}",
+        f"basename: {basename}",
+        f"role: {file_role}",
         f"language: {language}",
         f"lines: {chunk.start.line}-{chunk.end.line}",
     ]
-    symbols = _symbol_names_for_chunk(chunk.text)
     if symbols:
-        metadata.append(f"symbols: {', '.join(symbols)}")
+        metadata.append(f"symbols: {_join_metadata(symbols)}")
+    if enclosing_symbols:
+        metadata.append(f"context: {_join_metadata(enclosing_symbols)}")
     return "\n".join(["code:", chunk.text, "", "metadata:", *metadata])
 
 
@@ -393,6 +527,9 @@ async def _declare_chunk_batch(
     chunks: list[Chunk],
     file_path: str,
     language: str,
+    symbol_spans: list[_SymbolSpan],
+    file_role: str,
+    basename: str,
     id_gen: IdGenerator,
     embedder: Embedder,
     indexing_params: dict[str, Any],
@@ -401,10 +538,16 @@ async def _declare_chunk_batch(
     """Embed and declare a bounded batch of chunks."""
     pending_chunks: list[tuple[int, Chunk, str]] = []
     for chunk in chunks:
+        symbols = _symbol_names_for_chunk(chunk.text)
+        enclosing_symbols = _enclosing_symbol_names(chunk, symbol_spans)
         embedding_text = _embedding_text_for_chunk(
             file_path=file_path,
             language=language,
             chunk=chunk,
+            symbols=symbols,
+            enclosing_symbols=enclosing_symbols,
+            file_role=file_role,
+            basename=basename,
         )
         pending_chunks.append((await id_gen.next_id(chunk.text), chunk, embedding_text))
 
@@ -416,6 +559,8 @@ async def _declare_chunk_batch(
     )
 
     for (chunk_id, chunk, _), embedding in zip(pending_chunks, embeddings, strict=True):
+        symbols = _symbol_names_for_chunk(chunk.text)
+        enclosing_symbols = _enclosing_symbol_names(chunk, symbol_spans)
         table.declare_row(
             row=CodeChunk(
                 id=chunk_id,
@@ -424,6 +569,10 @@ async def _declare_chunk_batch(
                 content=chunk.text,
                 start_line=chunk.start.line,
                 end_line=chunk.end.line,
+                symbols=_join_metadata(symbols),
+                enclosing_symbols=_join_metadata(enclosing_symbols),
+                file_role=file_role,
+                basename=basename,
                 embedding=embedding,
             )
         )
@@ -467,6 +616,9 @@ async def process_file(
         language=language,
         chunker=chunker,
     )
+    symbol_spans = _symbol_spans_for_file(content, language)
+    file_role = _file_role(file.rel_path)
+    basename = rel_path.name
 
     id_gen = IdGenerator()
     for chunk_batch in _iter_chunk_batches(chunks, _chunk_embed_batch_size()):
@@ -474,6 +626,9 @@ async def process_file(
             chunks=chunk_batch,
             file_path=file.rel_path,
             language=language,
+            symbol_spans=symbol_spans,
+            file_role=file_role,
+            basename=basename,
             id_gen=id_gen,
             embedder=embedder,
             indexing_params=indexing_params,
@@ -497,7 +652,16 @@ async def indexer_main() -> None:
         ),
         virtual_table_def=Vec0TableDef(
             partition_key_columns=["language"],
-            auxiliary_columns=["file_path", "content", "start_line", "end_line"],
+            auxiliary_columns=[
+                "file_path",
+                "content",
+                "start_line",
+                "end_line",
+                "symbols",
+                "enclosing_symbols",
+                "file_role",
+                "basename",
+            ],
         ),
     )
 
