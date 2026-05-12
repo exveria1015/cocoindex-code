@@ -24,6 +24,7 @@ import cocoindex_code.indexer as _indexer
 from cocoindex_code.chunking import CHUNKER_REGISTRY, Chunk, TextPosition
 from cocoindex_code.daemon import ProjectRegistry
 from cocoindex_code.project import Project
+from cocoindex_code.query import _has_doc_intent, _has_test_intent, _query_word_set
 from cocoindex_code.settings import ProjectSettings, save_project_settings
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,19 @@ def _query_chunks(project_root: Path) -> list[dict[str, Any]]:
             return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def test_query_intent_words_include_identifier_subtokens() -> None:
+    words = _query_word_set("README.md *.md test_native_adapter.py fixtures")
+
+    assert "readme" in words
+    assert "markdown" in words
+    assert "test" in words
+    assert "fixtures" in words
+    assert _has_doc_intent(words)
+    assert _has_test_intent(words)
+
+    assert not _has_doc_intent(_query_word_set("md5 hashing implementation"))
 
 
 def _pos(line: int) -> TextPosition:
@@ -330,16 +344,16 @@ async def test_hybrid_search_prioritizes_exact_identifier_over_metadata_words(
     assert results[0].file_path == "src/indexer.py"
 
 
-async def test_hybrid_search_uses_identifier_subtokens_without_generic_drift(
+async def test_hybrid_search_downweights_tests_unless_test_intent_is_explicit(
     tmp_path: Path,
 ) -> None:
-    """Identifier-like prose should beat generic settings/env matches."""
+    """Behavior queries should prefer implementation unless tests are explicit."""
     (tmp_path / ".git").mkdir()
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
     (tmp_path / "src" / "settings.py").write_text(
-        "def save_environment_settings_variables():\n"
-        "    return 'settings environment variables settings'\n"
+        "def legacy_entry_creates_settings_from_environment_variables():\n"
+        "    return 'settings environment variables'\n"
     )
     (tmp_path / "tests" / "test_backward_compat.py").write_text(
         "def test_legacy_entry_creates_settings_from_env_vars():\n"
@@ -353,7 +367,41 @@ async def test_hybrid_search_uses_identifier_subtokens_without_generic_drift(
     )
 
     assert results
-    assert results[0].file_path == "tests/test_backward_compat.py"
+    assert results[0].file_path == "src/settings.py"
+
+    test_results = await project.search(
+        "pytest regression legacy entry creates settings from environment variables",
+        limit=3,
+    )
+
+    assert test_results
+    assert test_results[0].file_path == "tests/test_backward_compat.py"
+
+
+async def test_hybrid_search_downweights_docs_unless_doc_intent_is_explicit(
+    tmp_path: Path,
+) -> None:
+    """Docs should not beat implementation unless the query asks for docs."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "README.md").write_text(
+        "Docs explain configure path filter behavior for search examples.\n"
+    )
+    (tmp_path / "src" / "search.py").write_text(
+        "def configure_path_filter_behavior():\n"
+        "    return 'configure path filter behavior'\n"
+    )
+
+    project = await _index_project(tmp_path)
+    results = await project.search("configure path filter behavior", limit=3)
+
+    assert results
+    assert results[0].file_path == "src/search.py"
+
+    doc_results = await project.search("readme docs examples", limit=3)
+
+    assert doc_results
+    assert doc_results[0].file_path == "README.md"
 
 
 async def test_hybrid_search_prefers_enclosing_implementation_over_docs_and_tests(

@@ -100,8 +100,30 @@ _IMPLEMENTATION_INTENT_TERMS = {
     "streams",
     "where",
 }
-_TEST_INTENT_TERMS = {"assert", "fixture", "pytest", "regression", "test", "tests"}
-_DOC_INTENT_TERMS = {"docs", "documentation", "readme"}
+_TEST_INTENT_TERMS = {
+    "assert",
+    "fixture",
+    "fixtures",
+    "pytest",
+    "regression",
+    "test",
+    "testing",
+    "tests",
+    "unittest",
+}
+_DOC_INTENT_TERMS = {
+    "doc",
+    "docs",
+    "documentation",
+    "guide",
+    "markdown",
+    "readme",
+    "rst",
+}
+_DOC_EXTENSION_INTENT_TERMS = {"md", "mdx", "rst"}
+_DEFAULT_TEST_ROLE_PENALTY = 0.020
+_DEFAULT_DOCS_ROLE_PENALTY = 0.018
+_INTENT_ROLE_BONUS = 0.020
 
 
 @dataclass(frozen=True)
@@ -423,7 +445,18 @@ def _semantic_candidates(
 
 
 def _query_word_set(query: str) -> set[str]:
-    return {part.lower() for part in re.findall(r"[A-Za-z_][A-Za-z0-9_$./-]*|\d+", query)}
+    words: set[str] = set()
+    for part in re.findall(r"[A-Za-z_][A-Za-z0-9_$./-]*|\d+", query):
+        value = part.lower()
+        stripped = value.strip("._-/")
+        if stripped:
+            words.add(stripped)
+        if value in _DOC_EXTENSION_INTENT_TERMS or any(
+            value.endswith(f".{ext}") for ext in _DOC_EXTENSION_INTENT_TERMS
+        ):
+            words.add("markdown")
+        words.update(_identifier_subtokens(part))
+    return words
 
 
 def _metadata_text(*values: str) -> str:
@@ -489,19 +522,20 @@ def _rerank_bonus(
     implementation_intent = _has_implementation_intent(words)
     test_intent = _has_test_intent(words)
     doc_intent = _has_doc_intent(words)
+    if not test_intent and file_role == "test":
+        bonus -= _DEFAULT_TEST_ROLE_PENALTY
+    if not doc_intent and file_role == "docs":
+        bonus -= _DEFAULT_DOCS_ROLE_PENALTY
+    if test_intent and file_role == "test":
+        bonus += _INTENT_ROLE_BONUS
+    if doc_intent and file_role == "docs":
+        bonus += _INTENT_ROLE_BONUS
+
     if implementation_intent and not test_intent and not doc_intent:
         if file_role == "implementation":
             bonus += 0.035
-        elif file_role == "test":
-            bonus -= 0.035
-        elif file_role == "docs":
-            bonus -= 0.030
         elif file_role == "config":
             bonus -= 0.010
-    elif test_intent and file_role == "test":
-        bonus += 0.010
-    elif doc_intent and file_role == "docs":
-        bonus += 0.010
 
     return bonus
 
