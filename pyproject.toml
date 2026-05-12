@@ -40,14 +40,16 @@ dependencies = [
 # `sentence-transformers` (via cocoindex) so local embeddings work without
 # an API key.
 embeddings-local = ["cocoindex[sentence-transformers]>=1.0.0,<1.1.0"]
-# `full` is the umbrella "batteries-included" alias. Today it's just
-# `embeddings-local`, but we expect to bundle more optional niceties under
-# it over time — users who want everything can keep using `[full]` and pick
-# up the additions automatically. The name also matches the Docker
+# `full` is the umbrella "batteries-included" alias. It includes local
+# embeddings plus optional model-adapter dependencies that SentenceTransformer
+# repositories can require at load time. The name also matches the Docker
 # `:full` image variant for consistency across install paths. Contents are
 # inlined rather than self-referencing `cocoindex-code[embeddings-local]`
 # to avoid resolver edge cases with older pip.
-full = ["cocoindex[sentence-transformers]>=1.0.0,<1.1.0"]
+full = [
+    "cocoindex[sentence-transformers]>=1.0.0,<1.1.0",
+    "peft>=0.10.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
