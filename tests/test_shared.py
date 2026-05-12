@@ -10,6 +10,7 @@ import pytest
 from cocoindex_code.litellm_embedder import PacedLiteLLMEmbedder
 from cocoindex_code.settings import EmbeddingSettings
 from cocoindex_code.shared import (
+    _RuntimeVectorSchemaEmbedder,
     check_embedding,
     create_embedder,
     is_sentence_transformers_installed,
@@ -94,6 +95,23 @@ class _StubErrEmbedder:
         raise RuntimeError("boom")
 
 
+class _StubMismatchedSchemaEmbedder:
+    def __init__(self) -> None:
+        self.last_kwargs: dict[str, Any] | None = None
+
+    async def embed(self, text: str, **kwargs: Any) -> Any:
+        self.last_kwargs = dict(kwargs)
+        return np.zeros(640, dtype=np.float32)
+
+    async def __coco_vector_schema__(self) -> Any:
+        from cocoindex.resources import schema as _schema
+
+        return _schema.VectorSchema(dtype=np.dtype(np.float32), size=1024)
+
+    def __coco_memo_key__(self) -> object:
+        return ("mismatched-schema-stub",)
+
+
 async def test_check_embedding_ok() -> None:
     result = await check_embedding(_StubOkEmbedder())
     assert result.error is None
@@ -118,3 +136,23 @@ async def test_check_embedding_no_params_forwards_empty() -> None:
     stub = _StubOkEmbedder()
     await check_embedding(stub)
     assert stub.last_kwargs == {}
+
+
+async def test_runtime_vector_schema_uses_actual_embedding_length() -> None:
+    stub = _StubMismatchedSchemaEmbedder()
+    embedder = _RuntimeVectorSchemaEmbedder(stub)
+
+    schema = await embedder.__coco_vector_schema__()
+
+    assert schema.size == 640
+    assert schema.dtype == np.dtype(np.float32)
+
+
+async def test_runtime_vector_schema_embed_forwards_kwargs() -> None:
+    stub = _StubMismatchedSchemaEmbedder()
+    embedder = _RuntimeVectorSchemaEmbedder(stub)
+
+    vector = await embedder.embed("hello", prompt_name="query")
+
+    assert len(vector) == 640
+    assert stub.last_kwargs == {"prompt_name": "query"}

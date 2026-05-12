@@ -6,7 +6,7 @@ import importlib.util
 import logging
 import pathlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, Union
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, Protocol
 
 import cocoindex as coco
 import numpy as np
@@ -14,8 +14,7 @@ import numpy.typing as npt
 from cocoindex.connectors import sqlite
 
 if TYPE_CHECKING:
-    from cocoindex.ops.litellm import LiteLLMEmbedder
-    from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
+    from cocoindex.resources.schema import VectorSchema
 
 from .settings import EmbeddingSettings
 
@@ -24,8 +23,55 @@ logger = logging.getLogger(__name__)
 SBERT_PREFIX = "sbert/"
 DEFAULT_LITELLM_MIN_INTERVAL_MS = 5
 
-# Type alias
-Embedder = Union["SentenceTransformerEmbedder", "LiteLLMEmbedder"]
+class Embedder(Protocol):
+    async def embed(self, text: str, **kwargs: Any) -> Any: ...
+
+    async def __coco_vector_schema__(self) -> VectorSchema: ...
+
+    def __coco_memo_key__(self) -> object: ...
+
+
+class _RuntimeVectorSchemaEmbedder:
+    """Use the actual embedding vector length for CocoIndex table schemas.
+
+    Some SentenceTransformer repositories report one dimension from
+    ``get_sentence_embedding_dimension()`` but return another from ``encode()``
+    because their model code applies a default truncation. SQLite vec tables
+    need the inserted vector length, not the advertised base dimension.
+    """
+
+    def __init__(self, inner: Embedder) -> None:
+        self._inner = inner
+
+    async def embed(self, text: str, **kwargs: Any) -> Any:
+        return await self._inner.embed(text, **kwargs)
+
+    async def __coco_vector_schema__(self) -> VectorSchema:
+        from cocoindex.resources import schema as _schema
+
+        declared_size: int | None = None
+        try:
+            declared_schema = await self._inner.__coco_vector_schema__()
+            declared_size = declared_schema.size
+        except Exception:
+            logger.debug("failed to read declared embedding dimension", exc_info=True)
+
+        probe = await self._inner.embed("hello world")
+        actual_size = len(probe)
+        if declared_size is not None and declared_size != actual_size:
+            logger.warning(
+                "embedding dimension probe differs from declared schema: "
+                "declared=%s actual=%s; using actual vector length",
+                declared_size,
+                actual_size,
+            )
+        return _schema.VectorSchema(dtype=np.dtype(np.float32), size=actual_size)
+
+    def __coco_memo_key__(self) -> object:
+        return (
+            "runtime-vector-schema",
+            self._inner.__coco_memo_key__(),
+        )
 
 # Context keys
 EMBEDDER = coco.ContextKey[Embedder]("embedder", detect_change=True)
@@ -96,6 +142,7 @@ def create_embedder(
     only and the indexing default is supplied at the call site via
     :data:`INDEXING_EMBED_PARAMS`.
     """
+    instance: Embedder
     if settings.provider == "sentence-transformers":
         from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 
@@ -104,11 +151,12 @@ def create_embedder(
         if model_name.startswith(SBERT_PREFIX):
             model_name = model_name[len(SBERT_PREFIX) :]
 
-        instance: Embedder = SentenceTransformerEmbedder(
+        st_embedder = SentenceTransformerEmbedder(
             model_name,
             device=settings.device,
             trust_remote_code=True,
         )
+        instance = _RuntimeVectorSchemaEmbedder(st_embedder)
         logger.info("Embedding model: %s | device: %s", settings.model, settings.device)
     else:
         from .litellm_embedder import PacedLiteLLMEmbedder
