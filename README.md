@@ -502,12 +502,16 @@ With the `[full]` extra installed, `ccc init` defaults to a local SentenceTransf
 <details>
 <summary>DirectML (AMD/DirectX 12 GPUs)</summary>
 
-DirectML support is available for the local `sentence-transformers` provider when the Python environment running `ccc` has `torch-directml` installed. It is not included in the `[full]` extra because `torch-directml` has its own PyTorch/version constraints.
+DirectML support is available for the local `sentence-transformers` provider when the Python environment running `ccc` has `torch-directml` installed. Do not layer only `torch-directml` onto `[full]`; `torch-directml` pins PyTorch to `2.4.1`, so the Transformers stack also needs a compatible range.
 
-The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so a dedicated Python 3.12 tool environment is recommended:
+The current `torch-directml` wheels support CPython up to 3.12, so a dedicated Python 3.12 tool environment is recommended:
 
 ```bash
-uv tool install --python 3.12 --with torch-directml --upgrade "cocoindex-code[full]"
+uv tool install --python 3.12 \
+  --with torch-directml \
+  --with "sentence-transformers>=3.0,<4" \
+  --with "transformers>=4.41,<4.47" \
+  --upgrade "cocoindex-code[full]"
 ```
 
 ```yaml

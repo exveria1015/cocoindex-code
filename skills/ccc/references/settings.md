@@ -52,12 +52,16 @@ embedding:
   device: directml                                  # aliases: directml, dml, directml:0, dml:0
 ```
 
-Install `torch-directml` into the same Python environment that runs `ccc`, then run `ccc daemon restart`, `ccc doctor`, and `ccc index`.
+Install `torch-directml` and a PyTorch-2.4-compatible Transformers stack into the same Python environment that runs `ccc`, then run `ccc daemon restart`, `ccc doctor`, and `ccc index`.
 
-The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so prefer a dedicated Python 3.12 uv tool environment:
+The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so prefer a dedicated Python 3.12 uv tool environment. Do not layer only `torch-directml` onto `[full]`; that can resolve a Transformers stack that is too new for PyTorch 2.4.1.
 
 ```bash
-uv tool install --python 3.12 --with torch-directml --upgrade "cocoindex-code[full]"
+uv tool install --python 3.12 \
+  --with torch-directml \
+  --with "sentence-transformers>=3.0,<4" \
+  --with "transformers>=4.41,<4.47" \
+  --upgrade "cocoindex-code[full]"
 ```
 
 **Ollama (local):**
