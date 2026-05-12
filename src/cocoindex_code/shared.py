@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import logging
 import pathlib
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 SBERT_PREFIX = "sbert/"
 DEFAULT_LITELLM_MIN_INTERVAL_MS = 5
+_DIRECTML_DEVICE_ALIASES = {"directml", "dml"}
 
 class Embedder(Protocol):
     async def embed(self, text: str, **kwargs: Any) -> Any: ...
@@ -90,6 +92,48 @@ def is_sentence_transformers_installed() -> bool:
     return importlib.util.find_spec("sentence_transformers") is not None
 
 
+def _resolve_sentence_transformers_device(device: str | None) -> Any:
+    """Resolve user-facing device names to values accepted by SentenceTransformer.
+
+    DirectML is exposed by ``torch-directml`` through ``torch_directml.device()``.
+    That returns a PyTorch device object backed by the ``PrivateUse1`` backend,
+    not the literal string ``"directml"``.  We keep normal torch devices
+    (``cpu``, ``cuda``, ``mps``, etc.) as strings and only special-case
+    DirectML aliases.
+    """
+    if device is None:
+        return None
+
+    normalized = device.strip().lower()
+    name, sep, raw_index = normalized.partition(":")
+    if name not in _DIRECTML_DEVICE_ALIASES:
+        return device
+
+    device_id: int | None = None
+    if sep:
+        try:
+            device_id = int(raw_index)
+        except ValueError as e:
+            raise ValueError(
+                "DirectML device must be 'directml', 'dml', 'directml:N', or 'dml:N'"
+            ) from e
+        if device_id < 0:
+            raise ValueError("DirectML device index must be non-negative")
+
+    try:
+        torch_directml = importlib.import_module("torch_directml")
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "embedding.device is set to DirectML, but torch-directml is not installed "
+            "in the Python environment running ccc. Install torch-directml and restart "
+            "the ccc daemon."
+        ) from e
+
+    if device_id is None:
+        return torch_directml.device()
+    return torch_directml.device(device_id)
+
+
 class EmbeddingCheckResult(NamedTuple):
     """Outcome of a single embed-test call. See `check_embedding`.
 
@@ -151,9 +195,10 @@ def create_embedder(
         if model_name.startswith(SBERT_PREFIX):
             model_name = model_name[len(SBERT_PREFIX) :]
 
+        resolved_device = _resolve_sentence_transformers_device(settings.device)
         st_embedder = SentenceTransformerEmbedder(
             model_name,
-            device=settings.device,
+            device=resolved_device,
             trust_remote_code=True,
         )
         instance = _RuntimeVectorSchemaEmbedder(st_embedder)

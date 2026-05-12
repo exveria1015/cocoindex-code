@@ -390,7 +390,7 @@ Shared across all projects. Controls the embedding model and environment variabl
 embedding:
   provider: sentence-transformers                    # or "litellm"
   model: Snowflake/snowflake-arctic-embed-xs
-  device: mps                                        # optional: cpu, cuda, mps (auto-detected if omitted)
+  device: mps                                        # optional: cpu, cuda, mps, directml/dml (auto-detected if omitted)
   min_interval_ms: 300                               # optional: pace LiteLLM embedding requests to reduce 429s; defaults to 5 for LiteLLM
 
   # Optional extra kwargs passed to the embedder, separately for indexing vs query.
@@ -498,6 +498,34 @@ See [`src/cocoindex_code/chunking.py`](./src/cocoindex_code/chunking.py) for the
 With the `[full]` extra installed, `ccc init` defaults to a local SentenceTransformers model ([Snowflake/snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs)) — no API key required. To use a different model, edit `~/.cocoindex_code/global_settings.yml`.
 
 > The `envs` entries below are only needed if the key isn't already in your shell environment — the daemon inherits your environment automatically.
+
+<details>
+<summary>DirectML (AMD/DirectX 12 GPUs)</summary>
+
+DirectML support is available for the local `sentence-transformers` provider when the Python environment running `ccc` has `torch-directml` installed. It is not included in the `[full]` extra because `torch-directml` has its own PyTorch/version constraints.
+
+The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so a dedicated Python 3.12 tool environment is recommended:
+
+```bash
+uv tool install --python 3.12 --with torch-directml --upgrade "cocoindex-code[full]"
+```
+
+```yaml
+embedding:
+  provider: sentence-transformers
+  model: Snowflake/snowflake-arctic-embed-xs
+  device: directml   # aliases: directml, dml, directml:0, dml:0
+```
+
+After changing the device, restart the daemon and verify the model before rebuilding:
+
+```bash
+ccc daemon restart
+ccc doctor
+ccc index
+```
+
+</details>
 
 <details>
 <summary>Ollama (Local)</summary>

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from typing import Any
 
 import numpy as np
@@ -65,6 +67,129 @@ def test_create_embedder_sentence_transformers_ignores_indexing_params() -> None
     # No exception, and prompt_name is not stashed on the constructor —
     # it's a per-call argument supplied via the embed() call site.
     assert not isinstance(embedder, PacedLiteLLMEmbedder)
+
+
+def test_create_embedder_sentence_transformers_resolves_directml_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_device = object()
+    fake_directml = types.ModuleType("torch_directml")
+    fake_directml.device = lambda: fake_device  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch_directml", fake_directml)
+
+    captured: dict[str, Any] = {}
+
+    class FakeSentenceTransformerEmbedder:
+        def __init__(
+            self,
+            model_name_or_path: str,
+            *,
+            device: Any = None,
+            trust_remote_code: bool = False,
+        ) -> None:
+            captured["model_name_or_path"] = model_name_or_path
+            captured["device"] = device
+            captured["trust_remote_code"] = trust_remote_code
+
+        async def embed(self, text: str, **kwargs: Any) -> Any:
+            return np.zeros(384, dtype=np.float32)
+
+        async def __coco_vector_schema__(self) -> Any:
+            from cocoindex.resources import schema as _schema
+
+            return _schema.VectorSchema(dtype=np.dtype(np.float32), size=384)
+
+        def __coco_memo_key__(self) -> object:
+            return ("fake-sentence-transformer",)
+
+    import cocoindex.ops.sentence_transformers as st_module
+
+    monkeypatch.setattr(
+        st_module,
+        "SentenceTransformerEmbedder",
+        FakeSentenceTransformerEmbedder,
+    )
+
+    create_embedder(
+        EmbeddingSettings(
+            provider="sentence-transformers",
+            model="sbert/sentence-transformers/all-MiniLM-L6-v2",
+            device="directml",
+        )
+    )
+
+    assert captured["model_name_or_path"] == "sentence-transformers/all-MiniLM-L6-v2"
+    assert captured["device"] is fake_device
+    assert captured["trust_remote_code"] is True
+
+
+def test_create_embedder_sentence_transformers_resolves_directml_device_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_directml = types.ModuleType("torch_directml")
+    fake_directml.device = lambda device_id=None: ("dml-device", device_id)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch_directml", fake_directml)
+
+    captured: dict[str, Any] = {}
+
+    class FakeSentenceTransformerEmbedder:
+        def __init__(
+            self,
+            model_name_or_path: str,
+            *,
+            device: Any = None,
+            trust_remote_code: bool = False,
+        ) -> None:
+            captured["device"] = device
+
+        async def embed(self, text: str, **kwargs: Any) -> Any:
+            return np.zeros(384, dtype=np.float32)
+
+        async def __coco_vector_schema__(self) -> Any:
+            from cocoindex.resources import schema as _schema
+
+            return _schema.VectorSchema(dtype=np.dtype(np.float32), size=384)
+
+        def __coco_memo_key__(self) -> object:
+            return ("fake-sentence-transformer",)
+
+    import cocoindex.ops.sentence_transformers as st_module
+
+    monkeypatch.setattr(
+        st_module,
+        "SentenceTransformerEmbedder",
+        FakeSentenceTransformerEmbedder,
+    )
+
+    create_embedder(
+        EmbeddingSettings(
+            provider="sentence-transformers",
+            model="sentence-transformers/all-MiniLM-L6-v2",
+            device="dml:1",
+        )
+    )
+
+    assert captured["device"] == ("dml-device", 1)
+
+
+def test_create_embedder_sentence_transformers_directml_missing_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_import_module(name: str) -> types.ModuleType:
+        if name == "torch_directml":
+            raise ModuleNotFoundError(name)
+        return __import__(name)
+
+    monkeypatch.setattr("cocoindex_code.shared.importlib.import_module", fake_import_module)
+
+    with pytest.raises(RuntimeError, match="torch-directml"):
+        create_embedder(
+            EmbeddingSettings(
+                provider="sentence-transformers",
+                model="sentence-transformers/all-MiniLM-L6-v2",
+                device="dml",
+            )
+        )
 
 
 def test_is_sentence_transformers_installed_true_in_dev() -> None:

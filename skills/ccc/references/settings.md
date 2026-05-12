@@ -10,7 +10,7 @@ Shared across all projects. Controls the embedding model and extra environment v
 embedding:
   provider: sentence-transformers   # or "litellm" (default when provider is omitted)
   model: Snowflake/snowflake-arctic-embed-xs
-  device: mps                       # optional: cpu, cuda, mps (auto-detected if omitted)
+  device: mps                       # optional: cpu, cuda, mps, directml/dml (auto-detected if omitted)
   min_interval_ms: 300              # optional: pace LiteLLM embedding requests to reduce 429s; defaults to 5 for LiteLLM
 
 envs:                               # extra environment variables for the daemon
@@ -23,7 +23,7 @@ envs:                               # extra environment variables for the daemon
 |-------|-------------|
 | `embedding.provider` | `sentence-transformers` for local models, `litellm` (or omit) for cloud/remote models |
 | `embedding.model` | Model identifier — format depends on provider (see examples below) |
-| `embedding.device` | Optional. `cpu`, `cuda`, or `mps`. Auto-detected if omitted. Only relevant for `sentence-transformers`. |
+| `embedding.device` | Optional. `cpu`, `cuda`, `mps`, `directml`, or `dml`. Auto-detected if omitted. Only relevant for `sentence-transformers`; DirectML requires `torch-directml` in the Python environment running `ccc`. |
 | `embedding.min_interval_ms` | Optional. Minimum delay between LiteLLM embedding requests in milliseconds. Defaults to `5` for LiteLLM and is ignored by `sentence-transformers`. Set explicitly to override the default. |
 | `envs` | Key-value map of environment variables injected into the daemon. Use for API keys not already in the shell environment. |
 
@@ -41,6 +41,23 @@ embedding:
 embedding:
   provider: sentence-transformers
   model: nomic-ai/CodeRankEmbed                     # better code retrieval, needs GPU (~1 GB VRAM)
+```
+
+**DirectML (AMD/DirectX 12 GPUs):**
+
+```yaml
+embedding:
+  provider: sentence-transformers
+  model: Snowflake/snowflake-arctic-embed-xs
+  device: directml                                  # aliases: directml, dml, directml:0, dml:0
+```
+
+Install `torch-directml` into the same Python environment that runs `ccc`, then run `ccc daemon restart`, `ccc doctor`, and `ccc index`.
+
+The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so prefer a dedicated Python 3.12 uv tool environment:
+
+```bash
+uv tool install --python 3.12 --with torch-directml --upgrade "cocoindex-code[full]"
 ```
 
 **Ollama (local):**
