@@ -17,6 +17,18 @@ class IndexRequest(_msgspec.Struct, tag="index"):
     project_root: str
 
 
+class SearchFilter(_msgspec.Struct):
+    languages: list[str] | None = None
+    paths: list[str] | None = None
+    keywords: list[str] | None = None
+
+
+class SearchRanking(_msgspec.Struct):
+    exclude: SearchFilter | None = None
+    demote: SearchFilter | None = None
+    demote_score_multiplier: float | None = None
+
+
 class SearchRequest(_msgspec.Struct, tag="search"):
     project_root: str
     query: str
@@ -24,6 +36,8 @@ class SearchRequest(_msgspec.Struct, tag="search"):
     paths: list[str] | None = None
     limit: int = 5
     offset: int = 0
+    search_ranking: SearchRanking | None = None
+    ignore_search_settings: bool = False
 
 
 class ProjectStatusRequest(_msgspec.Struct, tag="project_status"):

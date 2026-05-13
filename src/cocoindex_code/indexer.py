@@ -265,6 +265,11 @@ class GitignoreAwareMatcher(FilePathMatcher):
     def is_file_included(self, path: PurePath) -> bool:
         if self._is_ignored(path, False):
             return False
+        for parent in path.parents:
+            if parent in (PurePath("."), PurePath("")):
+                break
+            if not self.is_dir_included(parent):
+                return False
         return self._delegate.is_file_included(path)
 
 

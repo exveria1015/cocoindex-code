@@ -183,6 +183,11 @@ The background daemon starts automatically on first use.
 ccc search database schema                           # basic search
 ccc search --lang python --lang markdown schema      # filter by language
 ccc search --path 'src/utils/*' query handler        # filter by path
+ccc search --path src query handler                  # directory path expands to src/*
+ccc search 'lang:kotlin coroutine scope'             # metadata language selector
+ccc search --demote-path legacy query handler        # one-time lower priority rule
+ccc search --exclude-keyword deprecated query        # one-time exclusion rule
+ccc search --no-search-settings query handler        # ignore project search rules
 ccc search --offset 10 --limit 5 database schema     # pagination
 ccc search --refresh database schema                 # update index first, then search
 ```
@@ -355,7 +360,7 @@ Pass configuration to `docker run` / compose with `-e`:
 -e COCOINDEX_CODE_EXTRA_EXTENSIONS="conf,sbt"
 
 # Exclude build artefacts (Scala/SBT example)
--e COCOINDEX_CODE_EXCLUDE_PATTERNS='["**/target/**","**/.bloop/**","**/.metals/**"]'
+-e COCOINDEX_CODE_EXCLUDED_PATTERNS='["**/target","**/.bloop","**/.metals"]'
 
 # Set an API key
 -e VOYAGE_API_KEY=your-key
@@ -450,6 +455,7 @@ exclude_patterns:
   - "**/.*"                # hidden directories
   - "**/__pycache__"
   - "**/node_modules"
+  - "**/build"
   - "**/dist"
   # ...
 
@@ -460,6 +466,17 @@ language_overrides:
 chunkers:
   - ext: toml              # use a custom chunker for .toml files
     module: example_toml_chunker:toml_chunker
+
+search:
+  exclude:                 # never return matching chunks
+    languages: []
+    paths: ["generated/**"]
+    keywords: ["DO NOT USE"]
+  demote:                  # keep searchable, but lower priority
+    languages: []
+    paths: ["legacy/**"]
+    keywords: ["deprecated", "old implementation"]
+  demote_score_multiplier: 0.5
 ```
 
 > `.cocoindex_code/` is automatically added to `.gitignore` during init.

@@ -24,6 +24,8 @@ from cocoindex_code.protocol import (
     RemoveProjectResponse,
     Request,
     Response,
+    SearchFilter,
+    SearchRanking,
     SearchRequest,
     SearchResponse,
     SearchResult,
@@ -62,6 +64,12 @@ def test_encode_decode_search_request_with_all_fields() -> None:
         paths=["src/*"],
         limit=20,
         offset=5,
+        search_ranking=SearchRanking(
+            exclude=SearchFilter(paths=["legacy/**"]),
+            demote=SearchFilter(keywords=["deprecated"]),
+            demote_score_multiplier=0.25,
+        ),
+        ignore_search_settings=True,
     )
     data = encode_request(req)
     decoded = decode_request(data)
@@ -72,6 +80,13 @@ def test_encode_decode_search_request_with_all_fields() -> None:
     assert decoded.paths == ["src/*"]
     assert decoded.limit == 20
     assert decoded.offset == 5
+    assert decoded.search_ranking is not None
+    assert decoded.search_ranking.exclude is not None
+    assert decoded.search_ranking.exclude.paths == ["legacy/**"]
+    assert decoded.search_ranking.demote is not None
+    assert decoded.search_ranking.demote.keywords == ["deprecated"]
+    assert decoded.search_ranking.demote_score_multiplier == 0.25
+    assert decoded.ignore_search_settings is True
 
 
 def test_encode_decode_search_response_with_results() -> None:

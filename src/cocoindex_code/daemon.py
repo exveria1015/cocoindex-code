@@ -57,6 +57,8 @@ from .protocol import (
 )
 from .settings import (
     ChunkerMapping,
+    SearchFilterSettings,
+    SearchRankingSettings,
     UserSettings,
     format_path_for_display,
     get_host_path_mappings,
@@ -324,6 +326,8 @@ async def _search_with_wait(
             paths=req.paths,
             limit=req.limit,
             offset=req.offset,
+            search_ranking_override=_search_ranking_from_request(req),
+            ignore_search_settings=req.ignore_search_settings,
         )
         yield SearchResponse(
             success=True,
@@ -333,6 +337,35 @@ async def _search_with_wait(
         )
     except Exception as e:
         yield ErrorResponse(message=str(e))
+
+
+def _search_filter_from_request_filter(filter_req: Any | None) -> SearchFilterSettings:
+    if filter_req is None:
+        return SearchFilterSettings()
+    return SearchFilterSettings(
+        languages=list(filter_req.languages or []),
+        paths=list(filter_req.paths or []),
+        keywords=list(filter_req.keywords or []),
+    )
+
+
+def _search_ranking_from_request(req: SearchRequest) -> SearchRankingSettings | None:
+    ranking = req.search_ranking
+    if ranking is None:
+        return None
+    multiplier = ranking.demote_score_multiplier
+    if multiplier is None:
+        has_demote = ranking.demote is not None and any(
+            (ranking.demote.languages, ranking.demote.paths, ranking.demote.keywords)
+        )
+        multiplier = 0.5 if has_demote else -1.0
+    if multiplier >= 0.0:
+        multiplier = max(0.0, min(1.0, multiplier))
+    return SearchRankingSettings(
+        exclude=_search_filter_from_request_filter(ranking.exclude),
+        demote=_search_filter_from_request_filter(ranking.demote),
+        demote_score_multiplier=multiplier,
+    )
 
 
 async def _handle_doctor(
@@ -537,6 +570,8 @@ async def _dispatch(
                 paths=req.paths,
                 limit=req.limit,
                 offset=req.offset,
+                search_ranking_override=_search_ranking_from_request(req),
+                ignore_search_settings=req.ignore_search_settings,
             )
             return SearchResponse(
                 success=True,

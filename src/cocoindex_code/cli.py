@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         DoctorCheckResult,
         IndexingProgress,
         ProjectStatusResponse,
+        SearchRanking,
         SearchResponse,
     )
 
@@ -233,6 +234,8 @@ def _search_with_wait_spinner(
     paths: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
+    search_ranking: SearchRanking | None = None,
+    ignore_search_settings: bool = False,
 ) -> SearchResponse:
     """Run search, showing a spinner if waiting for load-time indexing."""
     from rich.console import Console as _Console
@@ -258,10 +261,48 @@ def _search_with_wait_spinner(
             paths=paths,
             limit=limit,
             offset=offset,
+            search_ranking=search_ranking,
+            ignore_search_settings=ignore_search_settings,
             on_waiting=_on_waiting,
         )
 
     return resp
+
+
+def _search_ranking_override(
+    *,
+    exclude_lang: list[str],
+    exclude_path: list[str],
+    exclude_keyword: list[str],
+    demote_lang: list[str],
+    demote_path: list[str],
+    demote_keyword: list[str],
+    demote_score_multiplier: float | None,
+) -> SearchRanking | None:
+    from .protocol import SearchFilter, SearchRanking
+
+    has_exclude = bool(exclude_lang or exclude_path or exclude_keyword)
+    has_demote = bool(demote_lang or demote_path or demote_keyword)
+    if not has_exclude and not has_demote and demote_score_multiplier is None:
+        return None
+
+    return SearchRanking(
+        exclude=SearchFilter(
+            languages=exclude_lang or None,
+            paths=exclude_path or None,
+            keywords=exclude_keyword or None,
+        )
+        if has_exclude
+        else None,
+        demote=SearchFilter(
+            languages=demote_lang or None,
+            paths=demote_path or None,
+            keywords=demote_keyword or None,
+        )
+        if has_demote
+        else None,
+        demote_score_multiplier=demote_score_multiplier,
+    )
 
 
 _GITIGNORE_COMMENT = "# CocoIndex Code (ccc)"
@@ -560,6 +601,35 @@ def search(
     offset: int = _typer.Option(0, "--offset", help="Number of results to skip"),
     limit: int = _typer.Option(10, "--limit", help="Maximum results to return"),
     refresh: bool = _typer.Option(False, "--refresh", help="Refresh index before searching"),
+    exclude_lang: list[str] = _typer.Option(
+        [], "--exclude-lang", help="One-time search exclusion by language"
+    ),
+    exclude_path: list[str] = _typer.Option(
+        [], "--exclude-path", help="One-time search exclusion by file path glob"
+    ),
+    exclude_keyword: list[str] = _typer.Option(
+        [], "--exclude-keyword", help="One-time search exclusion by keyword"
+    ),
+    demote_lang: list[str] = _typer.Option(
+        [], "--demote-lang", help="One-time search demotion by language"
+    ),
+    demote_path: list[str] = _typer.Option(
+        [], "--demote-path", help="One-time search demotion by file path glob"
+    ),
+    demote_keyword: list[str] = _typer.Option(
+        [], "--demote-keyword", help="One-time search demotion by keyword"
+    ),
+    demote_score_multiplier: float | None = _typer.Option(
+        None,
+        "--demote-score-multiplier",
+        help="Score multiplier for one-time demotion rules",
+    ),
+    ignore_search_settings: bool = _typer.Option(
+        False,
+        "--no-search-settings",
+        "--ignore-search-settings",
+        help="Ignore project search exclude/demote settings for this query",
+    ),
 ) -> None:
     """Semantic search across the codebase."""
     project_root = str(require_project_root())
@@ -576,6 +646,15 @@ def search(
         default = resolve_default_path(Path(project_root))
         if default is not None:
             paths = [default]
+    search_ranking = _search_ranking_override(
+        exclude_lang=exclude_lang,
+        exclude_path=exclude_path,
+        exclude_keyword=exclude_keyword,
+        demote_lang=demote_lang,
+        demote_path=demote_path,
+        demote_keyword=demote_keyword,
+        demote_score_multiplier=demote_score_multiplier,
+    )
 
     resp = _search_with_wait_spinner(
         project_root=project_root,
@@ -584,6 +663,8 @@ def search(
         paths=paths,
         limit=limit,
         offset=offset,
+        search_ranking=search_ranking,
+        ignore_search_settings=ignore_search_settings,
     )
     print_search_results(resp)
 

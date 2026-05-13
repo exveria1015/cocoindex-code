@@ -79,7 +79,7 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     "**/__pycache__",  # Python cache
     "**/node_modules",  # Node.js dependencies
     "**/target",  # Rust/Maven build output
-    "**/build/assets",  # Build assets directories
+    "**/build",  # Build output directories
     "**/dist",  # Distribution directories
     "**/vendor/*.*/*",  # Go vendor directory (domain-based paths)
     "**/vendor/*",  # PHP vendor directory
@@ -123,11 +123,26 @@ class ChunkerMapping:
 
 
 @dataclass
+class SearchFilterSettings:
+    languages: list[str] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SearchRankingSettings:
+    exclude: SearchFilterSettings = field(default_factory=SearchFilterSettings)
+    demote: SearchFilterSettings = field(default_factory=SearchFilterSettings)
+    demote_score_multiplier: float = 0.5
+
+
+@dataclass
 class ProjectSettings:
     include_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_INCLUDED_PATTERNS))
     exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
     language_overrides: list[LanguageOverride] = field(default_factory=list)
     chunkers: list[ChunkerMapping] = field(default_factory=list)
+    search: SearchRankingSettings = field(default_factory=SearchRankingSettings)
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +499,63 @@ def _project_settings_to_dict(settings: ProjectSettings) -> dict[str, Any]:
         ]
     if settings.chunkers:
         d["chunkers"] = [{"ext": cm.ext, "module": cm.module} for cm in settings.chunkers]
+    search = _search_ranking_settings_to_dict(settings.search)
+    if search:
+        d["search"] = search
+    return d
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _search_filter_settings_from_dict(d: Any) -> SearchFilterSettings:
+    if not isinstance(d, dict):
+        return SearchFilterSettings()
+    return SearchFilterSettings(
+        languages=_string_list(d.get("languages", [])),
+        paths=_string_list(d.get("paths", [])),
+        keywords=_string_list(d.get("keywords", [])),
+    )
+
+
+def _search_filter_settings_to_dict(settings: SearchFilterSettings) -> dict[str, Any]:
+    d: dict[str, Any] = {}
+    if settings.languages:
+        d["languages"] = settings.languages
+    if settings.paths:
+        d["paths"] = settings.paths
+    if settings.keywords:
+        d["keywords"] = settings.keywords
+    return d
+
+
+def _search_ranking_settings_from_dict(d: Any) -> SearchRankingSettings:
+    if not isinstance(d, dict):
+        return SearchRankingSettings()
+    multiplier = d.get("demote_score_multiplier", 0.5)
+    if not isinstance(multiplier, int | float):
+        multiplier = 0.5
+    multiplier = max(0.0, min(1.0, float(multiplier)))
+    return SearchRankingSettings(
+        exclude=_search_filter_settings_from_dict(d.get("exclude", {})),
+        demote=_search_filter_settings_from_dict(d.get("demote", {})),
+        demote_score_multiplier=multiplier,
+    )
+
+
+def _search_ranking_settings_to_dict(settings: SearchRankingSettings) -> dict[str, Any]:
+    d: dict[str, Any] = {}
+    exclude = _search_filter_settings_to_dict(settings.exclude)
+    if exclude:
+        d["exclude"] = exclude
+    demote = _search_filter_settings_to_dict(settings.demote)
+    if demote:
+        d["demote"] = demote
+    if settings.demote_score_multiplier != 0.5:
+        d["demote_score_multiplier"] = settings.demote_score_multiplier
     return d
 
 
@@ -497,6 +569,7 @@ def _project_settings_from_dict(d: dict[str, Any]) -> ProjectSettings:
         exclude_patterns=d.get("exclude_patterns", list(DEFAULT_EXCLUDED_PATTERNS)),
         language_overrides=overrides,
         chunkers=chunkers,
+        search=_search_ranking_settings_from_dict(d.get("search", {})),
     )
 
 

@@ -17,6 +17,8 @@ from cocoindex_code.settings import (
     EmbeddingSettings,
     LanguageOverride,
     ProjectSettings,
+    SearchFilterSettings,
+    SearchRankingSettings,
     UserSettings,
     _reset_db_path_mapping_cache,
     _reset_host_path_mapping_cache,
@@ -61,6 +63,8 @@ def test_default_project_settings() -> None:
     s = default_project_settings()
     assert s.include_patterns == DEFAULT_INCLUDED_PATTERNS
     assert s.exclude_patterns == DEFAULT_EXCLUDED_PATTERNS
+    assert "**/build" in s.exclude_patterns
+    assert "**/build/assets" not in s.exclude_patterns
     assert s.language_overrides == []
 
 
@@ -89,6 +93,11 @@ def test_save_and_load_project_settings(tmp_path: Path) -> None:
         include_patterns=["**/*.py", "**/*.rs"],
         exclude_patterns=["**/target"],
         language_overrides=[LanguageOverride(ext="inc", lang="php")],
+        search=SearchRankingSettings(
+            exclude=SearchFilterSettings(paths=["legacy/**"], keywords=["DO NOT USE"]),
+            demote=SearchFilterSettings(languages=["javascript"], keywords=["deprecated"]),
+            demote_score_multiplier=0.25,
+        ),
     )
     save_project_settings(tmp_path, settings)
     loaded = load_project_settings(tmp_path)
@@ -97,6 +106,11 @@ def test_save_and_load_project_settings(tmp_path: Path) -> None:
     assert len(loaded.language_overrides) == 1
     assert loaded.language_overrides[0].ext == "inc"
     assert loaded.language_overrides[0].lang == "php"
+    assert loaded.search.exclude.paths == ["legacy/**"]
+    assert loaded.search.exclude.keywords == ["DO NOT USE"]
+    assert loaded.search.demote.languages == ["javascript"]
+    assert loaded.search.demote.keywords == ["deprecated"]
+    assert loaded.search.demote_score_multiplier == 0.25
 
 
 @pytest.mark.usefixtures("_patch_user_dir")

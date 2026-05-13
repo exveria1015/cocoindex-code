@@ -46,6 +46,7 @@ from .protocol import (
     RemoveProjectResponse,
     Request,
     Response,
+    SearchRanking,
     SearchRequest,
     SearchResponse,
     StopRequest,
@@ -280,6 +281,8 @@ def search(
     paths: list[str] | None = None,
     limit: int = 5,
     offset: int = 0,
+    search_ranking: SearchRanking | None = None,
+    ignore_search_settings: bool = False,
     on_waiting: Callable[[], None] | None = None,
 ) -> SearchResponse:
     """Search the codebase.
@@ -300,6 +303,8 @@ def search(
                     paths=paths,
                     limit=limit,
                     offset=offset,
+                    search_ranking=search_ranking,
+                    ignore_search_settings=ignore_search_settings,
                 )
             )
         )

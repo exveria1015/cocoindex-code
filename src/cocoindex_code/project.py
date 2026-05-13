@@ -24,10 +24,13 @@ from .protocol import (
 )
 from .query import query_codebase
 from .settings import (
-    cocoindex_db_path as _cocoindex_db_path,
+    SearchFilterSettings,
+    SearchRankingSettings,
+    load_project_settings,
+    resolve_db_dir,
 )
 from .settings import (
-    resolve_db_dir,
+    cocoindex_db_path as _cocoindex_db_path,
 )
 from .settings import (
     target_sqlite_db_path as _target_sqlite_db_path,
@@ -40,6 +43,35 @@ from .shared import (
     SQLITE_DB,
     Embedder,
 )
+
+
+def _merge_search_filter(
+    base: SearchFilterSettings,
+    override: SearchFilterSettings,
+) -> SearchFilterSettings:
+    return SearchFilterSettings(
+        languages=[*base.languages, *override.languages],
+        paths=[*base.paths, *override.paths],
+        keywords=[*base.keywords, *override.keywords],
+    )
+
+
+def _merge_search_ranking(
+    base: SearchRankingSettings,
+    override: SearchRankingSettings | None,
+) -> SearchRankingSettings:
+    if override is None:
+        return base
+    demote_score_multiplier = (
+        override.demote_score_multiplier
+        if override.demote_score_multiplier >= 0.0
+        else base.demote_score_multiplier
+    )
+    return SearchRankingSettings(
+        exclude=_merge_search_filter(base.exclude, override.exclude),
+        demote=_merge_search_filter(base.demote, override.demote),
+        demote_score_multiplier=demote_score_multiplier,
+    )
 
 
 class Project:
@@ -265,9 +297,16 @@ class Project:
         paths: list[str] | None = None,
         limit: int = 5,
         offset: int = 0,
+        search_ranking_override: SearchRankingSettings | None = None,
+        ignore_search_settings: bool = False,
     ) -> list[SearchResult]:
         """Search within this project."""
         target_db = _target_sqlite_db_path(self._project_root)
+        if ignore_search_settings:
+            search_ranking = search_ranking_override
+        else:
+            project_search_ranking = load_project_settings(self._project_root).search
+            search_ranking = _merge_search_ranking(project_search_ranking, search_ranking_override)
         results = await query_codebase(
             query=query,
             target_sqlite_db_path=target_db,
@@ -276,6 +315,7 @@ class Project:
             offset=offset,
             languages=languages,
             paths=paths,
+            search_ranking=search_ranking,
         )
         return [
             SearchResult(

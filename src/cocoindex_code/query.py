@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import heapq
 import re
 import sqlite3
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .schema import QueryResult
+from .settings import SearchFilterSettings, SearchRankingSettings
 from .shared import EMBEDDER, QUERY_EMBED_PARAMS, SQLITE_DB
 
 _HYBRID_FETCH_MIN = 50
@@ -64,10 +66,16 @@ _TOKEN_SYNONYMS = {
     "cpp": ("gguf", "llama_cpp"),
     "environment": ("env",),
     "environments": ("envs",),
+    "kt": ("kotlin",),
+    "kts": ("kotlin",),
     "kwargs": ("request_kwargs",),
     "llama": ("gguf", "llama_cpp"),
+    "md": ("markdown",),
     "parameter": ("param",),
     "parameters": ("params",),
+    "py": ("python",),
+    "rs": ("rust",),
+    "ts": ("typescript",),
     "variable": ("var",),
     "variables": ("vars",),
 }
@@ -124,6 +132,34 @@ _DOC_EXTENSION_INTENT_TERMS = {"md", "mdx", "rst"}
 _DEFAULT_TEST_ROLE_PENALTY = 0.020
 _DEFAULT_DOCS_ROLE_PENALTY = 0.018
 _INTENT_ROLE_BONUS = 0.020
+_GLOB_CHARS = frozenset("*?[")
+_LANGUAGE_SELECTOR_RE = re.compile(
+    r"(?<!\S)(?:lang|language):([A-Za-z0-9_+.#-]+(?:,[A-Za-z0-9_+.#-]+)*)",
+    re.IGNORECASE,
+)
+_LANGUAGE_ALIASES = {
+    "c++": "cpp",
+    "cc": "cpp",
+    "cs": "csharp",
+    "c#": "csharp",
+    "f03": "fortran",
+    "f90": "fortran",
+    "f95": "fortran",
+    "golang": "go",
+    "js": "javascript",
+    "jsx": "javascript",
+    "kt": "kotlin",
+    "kts": "kotlin",
+    "md": "markdown",
+    "mdx": "markdown",
+    "pas": "pascal",
+    "py": "python",
+    "rb": "ruby",
+    "rs": "rust",
+    "ts": "typescript",
+    "tsx": "tsx",
+    "yml": "yaml",
+}
 
 
 @dataclass(frozen=True)
@@ -148,11 +184,186 @@ def _candidate_limit(limit: int, offset: int) -> int:
     return max(requested, min(_HYBRID_FETCH_MAX, max(_HYBRID_FETCH_MIN, requested * 4)))
 
 
-def _path_conditions(paths: list[str] | None, params: list[Any]) -> str | None:
+def _normalize_language_name(language: str) -> str:
+    value = language.strip().lower().lstrip(".")
+    return _LANGUAGE_ALIASES.get(value, value)
+
+
+def _normalize_language_filters(languages: list[str] | None) -> list[str] | None:
+    if not languages:
+        return None
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in languages:
+        for part in raw.split(","):
+            value = _normalize_language_name(part)
+            if value and value not in seen:
+                normalized.append(value)
+                seen.add(value)
+    return normalized or None
+
+
+def _extract_language_selectors(query: str) -> tuple[str, list[str]]:
+    languages: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        languages.extend(match.group(1).split(","))
+        return " "
+
+    cleaned = _LANGUAGE_SELECTOR_RE.sub(replace, query)
+    return " ".join(cleaned.split()), languages
+
+
+def _normalize_path_pattern(pattern: str) -> str:
+    normalized = pattern.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
+    return normalized
+
+
+def _path_pattern_variants(pattern: str) -> list[str] | None:
+    pattern = _normalize_path_pattern(pattern)
+    if pattern in {"", ".", "*", "**", "**/*"}:
+        return None
+
+    variants = [pattern]
+    has_glob = any(ch in pattern for ch in _GLOB_CHARS)
+    if not has_glob:
+        variants.append(f"{pattern}/*")
+    if pattern.startswith("**/"):
+        variants.append(pattern[3:])
+    if "/**/" in pattern:
+        variants.append(pattern.replace("/**/", "/"))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        if variant and variant not in seen:
+            deduped.append(variant)
+            seen.add(variant)
+    return deduped
+
+
+def _expand_path_patterns(paths: list[str] | None) -> list[str] | None:
     if not paths:
         return None
-    path_clauses = " OR ".join("file_path GLOB ?" for _ in paths)
-    params.extend(paths)
+
+    expanded: list[str] = []
+    for path in paths:
+        variants = _path_pattern_variants(path)
+        if variants is None:
+            return None
+        expanded.extend(variants)
+    return expanded or None
+
+
+def _keyword_filter_condition(keywords: list[str], params: list[Any]) -> str | None:
+    clauses: list[str] = []
+    for keyword in keywords:
+        value = keyword.strip().lower()
+        if not value:
+            continue
+        like = _like_pattern(value)
+        clauses.append(
+            "("
+            "lower(content) LIKE ? ESCAPE '\\' OR "
+            "lower(file_path) LIKE ? ESCAPE '\\' OR "
+            "lower(symbols) LIKE ? ESCAPE '\\' OR "
+            "lower(enclosing_symbols) LIKE ? ESCAPE '\\' OR "
+            "lower(basename) LIKE ? ESCAPE '\\'"
+            ")"
+        )
+        params.extend([like, like, like, like, like])
+    if not clauses:
+        return None
+    return f"({' OR '.join(clauses)})"
+
+
+def _search_exclude_conditions(
+    search_exclude: SearchFilterSettings | None,
+    params: list[Any],
+) -> list[str]:
+    if search_exclude is None:
+        return []
+
+    conditions: list[str] = []
+    excluded_languages = _normalize_language_filters(search_exclude.languages)
+    if excluded_languages:
+        placeholders = ",".join("?" for _ in excluded_languages)
+        conditions.append(f"language NOT IN ({placeholders})")
+        params.extend(excluded_languages)
+
+    excluded_paths = _expand_path_patterns(search_exclude.paths)
+    if excluded_paths:
+        path_clauses = " OR ".join("file_path GLOB ?" for _ in excluded_paths)
+        conditions.append(f"NOT ({path_clauses})")
+        params.extend(excluded_paths)
+
+    keyword_condition = _keyword_filter_condition(search_exclude.keywords, params)
+    if keyword_condition is not None:
+        conditions.append(f"NOT {keyword_condition}")
+
+    return conditions
+
+
+def _has_search_filter(settings: SearchFilterSettings) -> bool:
+    return bool(settings.languages or settings.paths or settings.keywords)
+
+
+def _active_exclude_filter(
+    search_ranking: SearchRankingSettings | None,
+) -> SearchFilterSettings | None:
+    if search_ranking is None or not _has_search_filter(search_ranking.exclude):
+        return None
+    return search_ranking.exclude
+
+
+def _path_matches_any(file_path: str, patterns: list[str]) -> bool:
+    expanded = _expand_path_patterns(patterns)
+    if expanded is None:
+        return True
+    return any(fnmatch.fnmatchcase(file_path, pattern) for pattern in expanded)
+
+
+def _text_matches_any_keyword(values: tuple[str, ...], keywords: list[str]) -> bool:
+    if not keywords:
+        return False
+    text = "\n".join(values).lower()
+    return any(keyword.strip().lower() in text for keyword in keywords if keyword.strip())
+
+
+def _matches_search_filter(
+    settings: SearchFilterSettings,
+    *,
+    file_path: str,
+    language: str,
+    content: str,
+    symbols: str,
+    enclosing_symbols: str,
+    basename: str,
+) -> bool:
+    languages = _normalize_language_filters(settings.languages)
+    if languages and language.lower() in languages:
+        return True
+    if settings.paths and _path_matches_any(file_path, settings.paths):
+        return True
+    return _text_matches_any_keyword(
+        (file_path, content, symbols, enclosing_symbols, basename),
+        settings.keywords,
+    )
+
+
+def _path_conditions(paths: list[str] | None, params: list[Any]) -> str | None:
+    expanded_paths = _expand_path_patterns(paths)
+    if not expanded_paths:
+        return None
+    path_clauses = " OR ".join("file_path GLOB ?" for _ in expanded_paths)
+    params.extend(expanded_paths)
     return f"({path_clauses})"
 
 
@@ -160,16 +371,19 @@ def _filter_conditions(
     *,
     languages: list[str] | None,
     paths: list[str] | None,
+    search_exclude: SearchFilterSettings | None = None,
     params: list[Any],
 ) -> list[str]:
     conditions: list[str] = []
-    if languages:
-        placeholders = ",".join("?" for _ in languages)
+    normalized_languages = _normalize_language_filters(languages)
+    if normalized_languages:
+        placeholders = ",".join("?" for _ in normalized_languages)
         conditions.append(f"language IN ({placeholders})")
-        params.extend(languages)
+        params.extend(normalized_languages)
     path_condition = _path_conditions(paths, params)
     if path_condition is not None:
         conditions.append(path_condition)
+    conditions.extend(_search_exclude_conditions(search_exclude, params))
     return conditions
 
 
@@ -209,10 +423,16 @@ def _full_scan_query(
     limit: int,
     languages: list[str] | None = None,
     paths: list[str] | None = None,
+    search_exclude: SearchFilterSettings | None = None,
 ) -> list[tuple[Any, ...]]:
     """Full scan with SQL-level distance computation and filtering."""
     params: list[Any] = [embedding_bytes]
-    conditions = _filter_conditions(languages=languages, paths=paths, params=params)
+    conditions = _filter_conditions(
+        languages=languages,
+        paths=paths,
+        search_exclude=search_exclude,
+        params=params,
+    )
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     params.append(limit)
 
@@ -304,6 +524,7 @@ def _query_terms(query: str) -> list[_LexicalTerm]:
                     symbol_weight=0.8,
                     enclosing_weight=0.8,
                     basename_weight=0.7,
+                    language_weight=1.3,
                 ),
             )
 
@@ -317,6 +538,7 @@ def _query_terms(query: str) -> list[_LexicalTerm]:
                     symbol_weight=1.2,
                     enclosing_weight=1.4,
                     basename_weight=1.0,
+                    language_weight=1.1,
                 ),
             )
 
@@ -351,6 +573,7 @@ def _lexical_query(
     limit: int,
     languages: list[str] | None = None,
     paths: list[str] | None = None,
+    search_exclude: SearchFilterSettings | None = None,
 ) -> list[tuple[Any, ...]]:
     """Fetch lexical candidates with lightweight identifier/path scoring."""
     terms = _query_terms(query)
@@ -358,7 +581,12 @@ def _lexical_query(
         return []
 
     filter_params: list[Any] = []
-    conditions = _filter_conditions(languages=languages, paths=paths, params=filter_params)
+    conditions = _filter_conditions(
+        languages=languages,
+        paths=paths,
+        search_exclude=search_exclude,
+        params=filter_params,
+    )
 
     match_clauses: list[str] = []
     match_params: list[Any] = []
@@ -372,10 +600,11 @@ def _lexical_query(
             "lower(file_path) LIKE ? ESCAPE '\\' OR "
             "lower(symbols) LIKE ? ESCAPE '\\' OR "
             "lower(enclosing_symbols) LIKE ? ESCAPE '\\' OR "
-            "lower(basename) LIKE ? ESCAPE '\\'"
+            "lower(basename) LIKE ? ESCAPE '\\' OR "
+            "lower(language) = ?"
             ")"
         )
-        match_params.extend([like, like, like, like, like])
+        match_params.extend([like, like, like, like, like, term.value])
         score_terms.extend(
             [
                 "CASE WHEN lower(file_path) LIKE ? ESCAPE '\\' THEN ? ELSE 0.0 END",
@@ -427,9 +656,18 @@ def _semantic_candidates(
     fetch_k: int,
     languages: list[str] | None,
     paths: list[str] | None,
+    search_exclude: SearchFilterSettings | None,
 ) -> list[tuple[Any, ...]]:
-    if paths:
-        return _full_scan_query(conn, embedding_bytes, fetch_k, languages, paths)
+    languages = _normalize_language_filters(languages)
+    if paths or search_exclude is not None:
+        return _full_scan_query(
+            conn,
+            embedding_bytes,
+            fetch_k,
+            languages,
+            paths,
+            search_exclude=search_exclude,
+        )
     if not languages or len(languages) == 1:
         lang = languages[0] if languages else None
         return _knn_query(conn, embedding_bytes, fetch_k, lang)
@@ -546,6 +784,7 @@ def _fuse_results(
     query: str,
     limit: int,
     offset: int,
+    search_ranking: SearchRankingSettings | None = None,
 ) -> list[QueryResult]:
     combined: dict[int, dict[str, Any]] = {}
 
@@ -620,8 +859,8 @@ def _fuse_results(
     for item in combined.values():
         (
             file_path,
-            _language,
-            _content,
+            language,
+            content,
             _start_line,
             _end_line,
             symbols,
@@ -632,12 +871,23 @@ def _fuse_results(
         item["score"] += _rerank_bonus(
             query=query,
             file_path=file_path,
-            content=_content,
+            content=content,
             symbols=symbols,
             enclosing_symbols=enclosing_symbols,
             file_role=file_role,
             basename=basename,
         )
+        if search_ranking is not None and _has_search_filter(search_ranking.demote):
+            if _matches_search_filter(
+                search_ranking.demote,
+                file_path=file_path,
+                language=language,
+                content=content,
+                symbols=symbols,
+                enclosing_symbols=enclosing_symbols,
+                basename=basename,
+            ):
+                item["score"] *= search_ranking.demote_score_multiplier
 
     ranked = sorted(
         combined.values(),
@@ -673,6 +923,7 @@ async def query_codebase(
     offset: int = 0,
     languages: list[str] | None = None,
     paths: list[str] | None = None,
+    search_ranking: SearchRankingSettings | None = None,
 ) -> list[QueryResult]:
     """
     Perform hybrid code search using semantic vector search plus lexical matching.
@@ -687,16 +938,42 @@ async def query_codebase(
             "Please run a query with refresh_index=True first."
         )
 
+    query, selector_languages = _extract_language_selectors(query)
+    normalized_languages = _normalize_language_filters([*(languages or []), *selector_languages])
+    effective_query = query or " ".join(normalized_languages or [])
+    search_exclude = _active_exclude_filter(search_ranking)
+
     db = env.get_context(SQLITE_DB)
     embedder = env.get_context(EMBEDDER)
     query_params = env.get_context(QUERY_EMBED_PARAMS)
 
-    query_embedding = await embedder.embed(query, **query_params)
+    query_embedding = await embedder.embed(effective_query, **query_params)
     embedding_bytes = query_embedding.astype("float32").tobytes()
     fetch_k = _candidate_limit(limit, offset)
 
     with db.readonly() as conn:
-        semantic_rows = _semantic_candidates(conn, embedding_bytes, fetch_k, languages, paths)
-        lexical_rows = _lexical_query(conn, query, fetch_k, languages, paths)
+        semantic_rows = _semantic_candidates(
+            conn,
+            embedding_bytes,
+            fetch_k,
+            normalized_languages,
+            paths,
+            search_exclude,
+        )
+        lexical_rows = _lexical_query(
+            conn,
+            effective_query,
+            fetch_k,
+            normalized_languages,
+            paths,
+            search_exclude=search_exclude,
+        )
 
-    return _fuse_results(semantic_rows, lexical_rows, query, limit, offset)
+    return _fuse_results(
+        semantic_rows,
+        lexical_rows,
+        effective_query,
+        limit,
+        offset,
+        search_ranking=search_ranking,
+    )
