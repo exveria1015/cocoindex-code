@@ -502,16 +502,13 @@ With the `[full]` extra installed, `ccc init` defaults to a local SentenceTransf
 <details>
 <summary>DirectML (AMD/DirectX 12 GPUs)</summary>
 
-DirectML support is available for the local `sentence-transformers` provider when the Python environment running `ccc` has `torch-directml` installed. Do not layer only `torch-directml` onto `[full]`; `torch-directml` pins PyTorch to `2.4.1`, so the Transformers stack also needs a compatible range.
+DirectML support is available for the local `sentence-transformers` provider when the Python environment running `ccc` has the `directml` extra installed. Do not layer only `torch-directml` onto `[full]`; `torch-directml` pins PyTorch to `2.4.1`, so the SentenceTransformers / Transformers stack also needs a compatible range. The `directml` extra keeps SentenceTransformers below v4 while requiring `transformers>=4.51,<5`, which is new enough for Qwen3 embedding checkpoints.
 
 The current `torch-directml` wheels support CPython up to 3.12, so a dedicated Python 3.12 tool environment is recommended:
 
 ```bash
 uv tool install --python 3.12 \
-  --with torch-directml \
-  --with "sentence-transformers>=3.0,<4" \
-  --with "transformers>=4.41,<4.47" \
-  --upgrade "cocoindex-code[full]"
+  --upgrade "cocoindex-code[directml]"
 ```
 
 ```yaml

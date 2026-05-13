@@ -7,6 +7,7 @@ import importlib.util
 import logging
 import pathlib
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, Protocol
 
 import cocoindex as coco
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 SBERT_PREFIX = "sbert/"
 DEFAULT_LITELLM_MIN_INTERVAL_MS = 5
 _DIRECTML_DEVICE_ALIASES = {"directml", "dml"}
+_QWEN3_TRANSFORMERS_MIN_VERSION = "4.51.0"
 
 class Embedder(Protocol):
     async def embed(self, text: str, **kwargs: Any) -> Any: ...
@@ -134,6 +136,51 @@ def _resolve_sentence_transformers_device(device: str | None) -> Any:
     return torch_directml.device(device_id)
 
 
+def _installed_transformers_version() -> str:
+    try:
+        return version("transformers")
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def _is_directml_device(device: str | None) -> bool:
+    if device is None:
+        return False
+    return device.strip().lower().partition(":")[0] in _DIRECTML_DEVICE_ALIASES
+
+
+def _looks_like_qwen3_transformers_error(exc: BaseException) -> bool:
+    message = " ".join(str(exc).splitlines()).lower()
+    return (
+        "qwen3" in message
+        and "transformers" in message
+        and (
+            "does not recognize" in message
+            or "model type" in message
+            or "keyerror" in message
+        )
+    )
+
+
+def _qwen3_transformers_error(settings: EmbeddingSettings) -> RuntimeError:
+    installed = _installed_transformers_version()
+    if _is_directml_device(settings.device):
+        install_hint = (
+            'uv tool install --python 3.12 --upgrade "cocoindex-code[directml]"'
+        )
+    else:
+        install_hint = (
+            'uv tool install --upgrade --with "transformers>=4.51,<5" '
+            '"cocoindex-code[full]"'
+        )
+
+    return RuntimeError(
+        "Qwen3 embedding checkpoints require Transformers "
+        f">= {_QWEN3_TRANSFORMERS_MIN_VERSION}; the ccc environment has "
+        f"transformers {installed}. Reinstall the ccc tool environment with: {install_hint}"
+    )
+
+
 class EmbeddingCheckResult(NamedTuple):
     """Outcome of a single embed-test call. See `check_embedding`.
 
@@ -196,11 +243,16 @@ def create_embedder(
             model_name = model_name[len(SBERT_PREFIX) :]
 
         resolved_device = _resolve_sentence_transformers_device(settings.device)
-        st_embedder = SentenceTransformerEmbedder(
-            model_name,
-            device=resolved_device,
-            trust_remote_code=True,
-        )
+        try:
+            st_embedder = SentenceTransformerEmbedder(
+                model_name,
+                device=resolved_device,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            if _looks_like_qwen3_transformers_error(exc):
+                raise _qwen3_transformers_error(settings) from exc
+            raise
         instance = _RuntimeVectorSchemaEmbedder(st_embedder)
         logger.info("Embedding model: %s | device: %s", settings.model, settings.device)
     else:

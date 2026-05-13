@@ -50,6 +50,16 @@ full = [
     "cocoindex[sentence-transformers]>=1.0.0,<1.1.0",
     "peft>=0.10.0",
 ]
+# DirectML currently rides on torch-directml / PyTorch 2.4.1, so keep
+# SentenceTransformers below v4 while requiring a Transformers release new
+# enough to recognize Qwen3 embedding checkpoints.
+directml = [
+    "cocoindex[sentence-transformers]>=1.0.0,<1.1.0",
+    "peft>=0.10.0",
+    "torch-directml>=0.2.5.dev240914",
+    "sentence-transformers>=3.0,<4",
+    "transformers>=4.51,<5",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -115,4 +125,20 @@ addopts = "-v --tb=short -m 'not docker_e2e'"
 asyncio_mode = "auto"
 markers = [
     "docker_e2e: requires Docker; builds the image and runs containerized E2E tests. Run with: pytest -m docker_e2e",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "directml" },
+        { extra = "embeddings-local" },
+    ],
+    [
+        { extra = "directml" },
+        { extra = "full" },
+    ],
+    [
+        { extra = "directml" },
+        { group = "dev" },
+    ],
 ]

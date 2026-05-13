@@ -52,16 +52,13 @@ embedding:
   device: directml                                  # aliases: directml, dml, directml:0, dml:0
 ```
 
-Install `torch-directml` and a PyTorch-2.4-compatible Transformers stack into the same Python environment that runs `ccc`, then run `ccc daemon restart`, `ccc doctor`, and `ccc index`.
+Install the `directml` extra into the same Python environment that runs `ccc`, then run `ccc daemon restart`, `ccc doctor`, and `ccc index`.
 
-The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so prefer a dedicated Python 3.12 uv tool environment. Do not layer only `torch-directml` onto `[full]`; that can resolve a Transformers stack that is too new for PyTorch 2.4.1.
+The current `torch-directml` wheels support CPython up to 3.12 and pin PyTorch to `2.4.1`, so prefer a dedicated Python 3.12 uv tool environment. Do not layer only `torch-directml` onto `[full]`; that can resolve an incompatible SentenceTransformers / Transformers stack. The `directml` extra keeps SentenceTransformers below v4 and requires `transformers>=4.51,<5`, which is new enough for Qwen3 embedding checkpoints.
 
 ```bash
 uv tool install --python 3.12 \
-  --with torch-directml \
-  --with "sentence-transformers>=3.0,<4" \
-  --with "transformers>=4.41,<4.47" \
-  --upgrade "cocoindex-code[full]"
+  --upgrade "cocoindex-code[directml]"
 ```
 
 **Ollama (local):**

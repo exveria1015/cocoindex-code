@@ -192,6 +192,50 @@ def test_create_embedder_sentence_transformers_directml_missing_package(
         )
 
 
+def test_create_embedder_qwen3_transformers_error_has_directml_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_directml = types.ModuleType("torch_directml")
+    fake_directml.device = lambda: "dml-device"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch_directml", fake_directml)
+    monkeypatch.setattr("cocoindex_code.shared.version", lambda name: "4.46.3")
+
+    class FakeSentenceTransformerEmbedder:
+        def __init__(
+            self,
+            model_name_or_path: str,
+            *,
+            device: Any = None,
+            trust_remote_code: bool = False,
+        ) -> None:
+            raise ValueError(
+                "The checkpoint you are trying to load has model type `qwen3` "
+                "but Transformers does not recognize this architecture."
+            )
+
+    import cocoindex.ops.sentence_transformers as st_module
+
+    monkeypatch.setattr(
+        st_module,
+        "SentenceTransformerEmbedder",
+        FakeSentenceTransformerEmbedder,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        create_embedder(
+            EmbeddingSettings(
+                provider="sentence-transformers",
+                model="Qwen/Qwen3-Embedding-0.6B",
+                device="directml",
+            )
+        )
+
+    message = str(exc_info.value)
+    assert "Qwen3 embedding checkpoints require Transformers >= 4.51.0" in message
+    assert "transformers 4.46.3" in message
+    assert 'uv tool install --python 3.12 --upgrade "cocoindex-code[directml]"' in message
+
+
 def test_is_sentence_transformers_installed_true_in_dev() -> None:
     # Dev env pulls in sentence-transformers via the `dev` extras group.
     assert is_sentence_transformers_installed() is True
